@@ -243,7 +243,7 @@ class FinQAAgent:
             parts.append(
                 f"--- Document {i} "
                 f"(hybrid_score={doc.get('hybrid_score', 0):.3f}) ---\n"
-                f"{doc['context'][:1500]}"
+                f"{doc['context'][:300]}"
             )
         return "\n\n".join(parts)
 
@@ -301,7 +301,7 @@ class FinQAAgent:
                         {"role": "system", "content": REASON_SYSTEM},
                         {"role": "user", "content": user_prompt},
                     ],
-                    max_tokens=config.vllm.max_tokens,
+                    max_tokens=256,  # Reduced for 2048 token limit
                     temperature=config.vllm.temperature,
                 )
                 reasoning_text = response.choices[0].message.content or ""
