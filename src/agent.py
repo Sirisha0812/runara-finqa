@@ -621,6 +621,17 @@ def _fallback_answer(reasoning: str, calc_result: Optional[str], error: Exceptio
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="FinQA Agent - Financial Question Answering with LangGraph")
+    parser.add_argument(
+        "--question",
+        type=str,
+        default="what is the interest expense in 2009?",
+        help="Question to ask the agent (default: 'what is the interest expense in 2009?')"
+    )
+    args = parser.parse_args()
+
     print("\n" + "=" * 80)
     print("FinQA Agent — LangGraph Workflow Demo")
     print("=" * 80)
@@ -635,10 +646,9 @@ if __name__ == "__main__":
     else:
         print("Hybrid FAISS + BM25 index loaded successfully.")
 
-    TEST_QUERY = "what is the interest expense in 2009?"
-    print(f"\nTest Query: {TEST_QUERY}\n")
+    print(f"\nQuestion: {args.question}\n")
 
-    result = agent.run(TEST_QUERY)
+    result = agent.run(args.question)
 
     # ── Print full reasoning trace ──────────────────────────────────────────
     print("\n" + "=" * 80)
