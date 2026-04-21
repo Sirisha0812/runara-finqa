@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'finqa-monitor'
+
+scrape_configs:
+  - job_name: 'finqa-agent'
+    static_configs:
+      - targets: ['host.docker.internal:8001']
+        labels:
+          service: 'finqa-agent'
+          environment: 'development'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    metrics_path: '/metrics'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

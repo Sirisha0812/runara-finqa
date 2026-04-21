@@ -6,3 +6,10 @@ __pycache__/
 .venv/
 venv/
 .vscode/
+
+# Data directories
+data/
+
+# Docker volumes (monitoring data)
+prometheus-data/
+grafana-data/
