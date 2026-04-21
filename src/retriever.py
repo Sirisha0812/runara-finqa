@@ -71,6 +71,66 @@ class FinQARetriever:
         # Simple tokenization: lowercase, split on whitespace, filter short tokens
         return [token.lower() for token in text.split() if len(token) > 1]
 
+    def _has_company_name(self, query: str) -> bool:
+        """
+        Detect if query contains a company name or stock-related proper noun.
+
+        Only triggers boost for actual company/stock queries, not geographic locations.
+
+        Args:
+            query: Query string
+
+        Returns:
+            True if query contains company indicators
+        """
+        # Stock/company indicator words
+        company_indicators = {
+            "stock", "stocks", "share", "shares", "corp", "corporation",
+            "inc", "incorporated", "ltd", "limited", "common", "preferred",
+            "equity", "equities", "ticker", "nasdaq", "nyse", "s&p"
+        }
+
+        # Geographic and temporal proper nouns to exclude
+        excluded_proper_nouns = {
+            # Countries
+            "canada", "china", "japan", "india", "france", "germany", "italy",
+            "spain", "brazil", "mexico", "russia", "korea", "australia",
+            "netherlands", "sweden", "norway", "denmark", "finland", "ireland",
+            "united", "states", "kingdom", "america", "american",
+            # Cities
+            "new", "york", "london", "paris", "tokyo", "toronto", "chicago",
+            "boston", "houston", "dallas", "seattle", "francisco", "los", "angeles",
+            # Months
+            "january", "february", "march", "april", "may", "june", "july",
+            "august", "september", "october", "november", "december",
+            # Common question words
+            "what", "when", "where", "who", "why", "how", "the", "is", "was",
+            "were", "are", "will", "would", "could", "should"
+        }
+
+        query_lower = query.lower()
+
+        # First check: does query contain stock/company indicator words?
+        has_indicator = any(indicator in query_lower for indicator in company_indicators)
+
+        if not has_indicator:
+            # No company indicators, don't boost
+            return False
+
+        # Second check: find capitalized words that aren't excluded
+        words = query.split()
+        for word in words:
+            # Strip punctuation from word
+            clean_word = word.strip(",.?!;:")
+
+            if clean_word and clean_word[0].isupper():
+                word_lower = clean_word.lower()
+                # If it's capitalized AND not in exclusion list, it's likely a company
+                if word_lower not in excluded_proper_nouns:
+                    return True
+
+        return False
+
     def build_index(self) -> None:
         """Build both FAISS and BM25 indices from train set."""
         with LoggerContext(logger, "build_index"):
@@ -315,7 +375,7 @@ class FinQARetriever:
     def retrieve_hybrid(
         self,
         query: str,
-        k: int = 5,
+        k: int = 8,
         faiss_weight: float = 0.7,
         bm25_weight: float = 0.3,
     ) -> List[Dict[str, Any]]:
@@ -323,12 +383,13 @@ class FinQARetriever:
         Retrieve top-k relevant documents using hybrid FAISS + BM25 retrieval.
 
         Combines dense (FAISS) and sparse (BM25) retrieval using weighted score fusion.
+        Automatically boosts BM25 weight when company names are detected in query.
 
         Args:
             query: Query string
-            k: Number of documents to retrieve
-            faiss_weight: Weight for FAISS scores (default 0.7)
-            bm25_weight: Weight for BM25 scores (default 0.3)
+            k: Number of documents to retrieve (default 8)
+            faiss_weight: Weight for FAISS scores (default 0.7, adjusted to 0.5 if company name detected)
+            bm25_weight: Weight for BM25 scores (default 0.3, adjusted to 0.5 if company name detected)
 
         Returns:
             List of documents with metadata and hybrid scores
@@ -336,6 +397,18 @@ class FinQARetriever:
         if self.faiss_index is None or self.bm25_index is None:
             logger.error("retrieve_hybrid_failed", reason="indices_not_loaded")
             raise RuntimeError("Indices not loaded. Call load_index() or build_index() first.")
+
+        # Detect company names and adjust weights
+        has_company = self._has_company_name(query)
+        if has_company:
+            faiss_weight = 0.5
+            bm25_weight = 0.5
+            logger.info(
+                "company_name_detected",
+                query=query,
+                adjusted_faiss_weight=faiss_weight,
+                adjusted_bm25_weight=bm25_weight,
+            )
 
         with LoggerContext(
             logger,
@@ -422,6 +495,7 @@ class FinQARetriever:
                 top_hybrid_score=results[0]["hybrid_score"] if results else None,
                 faiss_weight=faiss_weight,
                 bm25_weight=bm25_weight,
+                company_boost_active=has_company,
             )
 
             return results
