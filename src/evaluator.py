@@ -203,7 +203,21 @@ class FinQAEvaluator:
         # Load validation set
         print(f"\nLoading {num_examples} validation examples...")
         val_dataset = load_finqa_dataset(split="validation")
-        examples = val_dataset[:num_examples]
+
+        # HuggingFace Dataset slicing returns dict of lists, convert to list of dicts
+        examples_slice = val_dataset[:num_examples]
+        num_loaded = len(examples_slice["question"])
+
+        # Convert from dict of lists to list of dicts
+        examples = [
+            {
+                "question": examples_slice["question"][i],
+                "answer": examples_slice["answer"][i],
+                "program": examples_slice["program"][i],
+                "exe_ans": examples_slice["exe_ans"][i],
+            }
+            for i in range(num_loaded)
+        ]
 
         print(f"\nEvaluating {len(examples)} examples...\n")
 
