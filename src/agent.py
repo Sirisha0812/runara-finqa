@@ -1,15 +1,19 @@
-"""LangGraph-based FinQA agent with retrieval, reasoning, calculation, verification, and retry."""
+"""LangChain + LangGraph FinQA chatbot powered by a vLLM-served HF model."""
+
+from __future__ import annotations
 
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
-from openai import OpenAI
 from typing_extensions import TypedDict
 
 try:
     from sympy import N, sympify
+
     SYMPY_AVAILABLE = True
 except ImportError:
     SYMPY_AVAILABLE = False
@@ -20,723 +24,540 @@ from src.retriever import FinQARetriever
 
 logger = get_logger(__name__)
 
-MAX_RETRIES = 2
 
+REASON_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a financial analyst answering FinQA-style questions.
 
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
+Use only the provided evidence chunks. Financial answers must stay anchored to exact values from the evidence.
 
-class AgentState(TypedDict):
-    """Full state passed through every node of the LangGraph workflow."""
-    question: str
-    retrieved_docs: List[Dict[str, Any]]
-    reasoning: str
-    calculation_expression: Optional[str]
-    calculation_result: Optional[str]
-    verification_status: str        # "PASS" | "FAIL" | "UNCERTAIN" | "SKIPPED"
-    verification_issues: List[str]  # empty when status is PASS or SKIPPED
-    verification_confidence: str    # "HIGH" | "MEDIUM" | "LOW" | "N/A"
-    retry_count: int                # incremented each time reason_node runs as a retry
-    failure_feedback: Optional[str] # injected into reason_node prompt on retry
-    retry_exhausted: bool           # True when FAIL and retry_count >= MAX_RETRIES
-    final_answer: str
-    trace: List[Dict[str, Any]]
-    node_traces: List[Dict[str, Any]]  # timing audit trail: one entry per node execution
-
-
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-
-REASON_SYSTEM = """You are a financial analysis expert. Given a question and relevant financial documents, reason step by step to find the answer.
-
-Your response MUST follow this exact format with no extra text between sections:
-
+Respond with this exact structure:
 REASONING:
-[Step-by-step reasoning referencing specific numbers from the documents]
+- step 1
+- step 2
 
 CALCULATION:
-[A single Python arithmetic expression using only numbers and + - * / ( ).
-Example: 3.8 / 0.01
-Write NONE if the answer is directly readable from the documents with no arithmetic needed]
+<single arithmetic expression using only numbers and + - * / ( ) or NONE>
 
 PRELIMINARY_ANSWER:
-[Your answer before applying the calculation, or the final answer if CALCULATION is NONE]"""
+<short answer with units if available>
 
-VERIFY_SYSTEM = """You are a financial fact-checker. Your job is to verify that a reasoning chain and its answer are consistent with the source documents provided.
+EVIDENCE_IDS:
+- <chunk_id>
+- <chunk_id>""",
+        ),
+        (
+            "human",
+            """Question:
+{question}
 
-Check three things:
-1. Are the numbers used in the reasoning actually present in (or derivable from) the retrieved documents?
-2. Is the arithmetic expression correct for the stated reasoning steps?
-3. Does the calculation result match the preliminary answer?
+Evidence Chunks:
+{evidence}
 
-Your response MUST follow this exact format:
+Previous verification feedback:
+{feedback}""",
+        ),
+    ]
+)
 
+
+VERIFY_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are checking whether a FinQA answer is properly supported.
+
+Review the reasoning against the evidence. Pay special attention to:
+1. unsupported numbers
+2. wrong arithmetic
+3. missing units
+4. claims that are not grounded in the evidence
+
+Respond with this exact format:
 VERIFICATION_STATUS: PASS | FAIL | UNCERTAIN
 CONFIDENCE: HIGH | MEDIUM | LOW
 ISSUES:
-- [Issue 1, or write NONE if no issues]
-- [Issue 2, etc.]"""
+- <issue or NONE>""",
+        ),
+        (
+            "human",
+            """Question:
+{question}
 
-ANSWER_SYSTEM = """You are a financial analysis assistant. Given the full reasoning trace, calculation result, and verification outcome, provide a concise final answer following the instruction below exactly."""
+Evidence Chunks:
+{evidence}
 
+Reasoning Draft:
+{reasoning}
 
-# ---------------------------------------------------------------------------
-# Answer-mode instructions (injected per routing outcome)
-# ---------------------------------------------------------------------------
-
-_ANSWER_MODE_INSTRUCTIONS: Dict[str, str] = {
-    # PASS + HIGH  — clean, confident answer
-    "CONFIDENT": (
-        "Verification PASSED with HIGH confidence. "
-        "State the answer directly and confidently.\n\n"
-        "Format:\nFINAL_ANSWER: [value]\nEXPLANATION: [one sentence]"
-    ),
-    # PASS + MEDIUM — answer with a light caveat
-    "CAVEAT": (
-        "Verification PASSED but with MEDIUM confidence. "
-        "State the answer and add a brief caveat noting that confidence is medium.\n\n"
-        "Format:\nFINAL_ANSWER: [value]\nEXPLANATION: [one sentence including caveat]"
-    ),
-    # UNCERTAIN — flag for human review
-    "HUMAN_REVIEW": (
-        "Verification returned UNCERTAIN. "
-        "State the best available answer but clearly flag it for human review.\n\n"
-        "Format:\nFINAL_ANSWER: [value] (flagged for human review)\nEXPLANATION: [one sentence noting uncertainty]"
-    ),
-    # FAIL + retries exhausted — low-confidence warning
-    "MAX_RETRIES": (
-        f"Verification FAILED after {MAX_RETRIES} retry attempts. "
-        "State the best available answer but clearly warn that max retries were reached and confidence is low.\n\n"
-        "Format:\nFINAL_ANSWER: [value] (low confidence — max retries reached)\nEXPLANATION: [one sentence noting failure]"
-    ),
-}
+Calculation Result:
+{calculation_result}""",
+        ),
+    ]
+)
 
 
-def _answer_mode(v_status: str, v_confidence: str, retry_exhausted: bool) -> str:
-    """Map verification outcome to one of the four answer modes."""
-    if retry_exhausted:
-        return "MAX_RETRIES"
-    if v_status == "PASS" and v_confidence == "HIGH":
-        return "CONFIDENT"
-    if v_status == "PASS":          # MEDIUM or LOW
-        return "CAVEAT"
-    if v_status == "UNCERTAIN":
-        return "HUMAN_REVIEW"
-    return "CAVEAT"                 # FAIL routed here only if somehow past routing guard
+ANSWER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are formatting the final answer for a financial QA chatbot.
+
+Keep it concise and factual. If verification failed or remained uncertain, state that clearly.
+
+Return:
+FINAL_ANSWER: <answer>
+EXPLANATION: <one sentence>""",
+        ),
+        (
+            "human",
+            """Question:
+{question}
+
+Reasoning Draft:
+{reasoning}
+
+Preliminary Answer:
+{preliminary_answer}
+
+Calculation Result:
+{calculation_result}
+
+Verification Status:
+{verification_status}
+
+Verification Confidence:
+{verification_confidence}
+
+Verification Issues:
+{verification_issues}""",
+        ),
+    ]
+)
 
 
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
+class AgentState(TypedDict):
+    """State passed through the LangGraph workflow."""
+
+    question: str
+    example: Dict[str, Any]
+    retrieved_chunks: List[Dict[str, Any]]
+    reasoning: str
+    preliminary_answer: str
+    cited_evidence_ids: List[str]
+    calculation_expression: Optional[str]
+    calculation_result: Optional[str]
+    verification_status: str
+    verification_confidence: str
+    verification_issues: List[str]
+    retry_count: int
+    failure_feedback: str
+    final_answer: str
+    trace: List[Dict[str, Any]]
+    node_traces: List[Dict[str, Any]]
+
 
 class FinQAAgent:
-    """LangGraph-based agent for FinQA numerical reasoning over financial reports."""
+    """LangGraph workflow for FinQA reasoning over a single financial document."""
 
-    def __init__(self, index_path: str = "./data/faiss_index"):
-        self.retriever = FinQARetriever(index_path=index_path)
-        self.llm = OpenAI(
+    def __init__(self) -> None:
+        self.retriever = FinQARetriever()
+        self.llm = ChatOpenAI(
+            model=config.vllm.model,
+            api_key=config.vllm.api_key,
             base_url=config.vllm.api_base,
-            api_key="not-needed",
+            temperature=config.vllm.temperature,
+            max_completion_tokens=config.vllm.max_tokens,
+            timeout=config.vllm.timeout_seconds,
         )
-        self.model = config.vllm.model
+        self.max_retries = config.agent.max_retries
         self.graph = self._build_graph()
 
         logger.info(
             "agent_initialized",
-            model=self.model,
-            index_path=index_path,
-            sympy_available=SYMPY_AVAILABLE,
-            max_retries=MAX_RETRIES,
+            model=config.vllm.model,
+            api_base=config.vllm.api_base,
+            max_retries=self.max_retries,
+            retriever_scope="document_local",
         )
-
-    # -----------------------------------------------------------------------
-    # Graph construction
-    # -----------------------------------------------------------------------
 
     def _build_graph(self) -> Any:
         workflow = StateGraph(AgentState)
-
-        # Nodes
         workflow.add_node("retrieve", self._retrieve_node)
         workflow.add_node("reason", self._reason_node)
-        workflow.add_node("calculator", self._calculator_node)
-        workflow.add_node("verifier", self._verifier_node)
+        workflow.add_node("calculate", self._calculate_node)
+        workflow.add_node("verify", self._verify_node)
         workflow.add_node("answer", self._answer_node)
 
-        # Fixed edges
         workflow.set_entry_point("retrieve")
         workflow.add_edge("retrieve", "reason")
-        workflow.add_edge("reason", "calculator")
-        workflow.add_edge("calculator", "verifier")
-        workflow.add_edge("answer", END)
-
-        # Conditional edge: verifier → reason (retry) | answer
+        workflow.add_edge("reason", "calculate")
+        workflow.add_edge("calculate", "verify")
         workflow.add_conditional_edges(
-            "verifier",
-            self._route_after_verifier,
-            {
-                "retry": "reason",
-                "answer": "answer",
-            },
+            "verify",
+            self._route_after_verify,
+            {"retry": "reason", "answer": "answer"},
         )
-
+        workflow.add_edge("answer", END)
         return workflow.compile()
 
-    # -----------------------------------------------------------------------
-    # Routing function
-    # -----------------------------------------------------------------------
-
-    def _route_after_verifier(self, state: AgentState) -> str:
-        """
-        Route to 'retry' (back to reason_node) when verification FAILs and
-        retries remain; otherwise route to 'answer'.
-        """
-        if state["verification_status"] == "FAIL" and state["retry_count"] < MAX_RETRIES:
-            logger.info(
-                "routing_to_retry",
-                retry_count=state["retry_count"],
-                max_retries=MAX_RETRIES,
-            )
+    def _route_after_verify(self, state: AgentState) -> str:
+        if (
+            state["verification_status"] == "FAIL"
+            and state["retry_count"] < self.max_retries
+        ):
             return "retry"
-
-        logger.info(
-            "routing_to_answer",
-            verification_status=state["verification_status"],
-            retry_count=state["retry_count"],
-            retry_exhausted=state["retry_exhausted"],
-        )
         return "answer"
 
-    # -----------------------------------------------------------------------
-    # Node: retrieve
-    # -----------------------------------------------------------------------
+    @staticmethod
+    def _format_evidence(chunks: List[Dict[str, Any]]) -> str:
+        formatted = []
+        for chunk in chunks:
+            formatted.append(
+                f"[{chunk['chunk_id']}] ({chunk['chunk_type']}, score={chunk['hybrid_score']:.3f}) "
+                f"{chunk['text']}"
+            )
+        return "\n".join(formatted)
+
+    def _record_node_trace(
+        self,
+        state: AgentState,
+        node: str,
+        start_time: float,
+        status: str = "ok",
+        **kwargs: Any,
+    ) -> None:
+        state["node_traces"].append(
+            {
+                "node": node,
+                "duration_ms": round((time.perf_counter() - start_time) * 1000, 2),
+                "status": status,
+                **kwargs,
+            }
+        )
 
     def _retrieve_node(self, state: AgentState) -> AgentState:
-        """Hybrid FAISS + BM25 retrieval of the top-4 most relevant documents."""
+        start = time.perf_counter()
         question = state["question"]
-        _t0 = time.perf_counter()
 
         with LoggerContext(logger, "retrieve_node", question=question):
-            docs = self.retriever.retrieve_hybrid(question, k=4)
-
-            state["retrieved_docs"] = docs
-            state["trace"].append({
-                "node": "retrieve",
-                "num_docs": len(docs),
-                "top_hybrid_score": docs[0]["hybrid_score"] if docs else None,
-                "retrieved_questions": [d["question"] for d in docs],
-            })
-
-        state["node_traces"].append({"node": "retrieve", "duration_ms": round((time.perf_counter() - _t0) * 1000, 2), "status": "ok"})
-        return state
-
-    # -----------------------------------------------------------------------
-    # Node: reason
-    # -----------------------------------------------------------------------
-
-    def _format_context(self, docs: List[Dict[str, Any]]) -> str:
-        """Format retrieved documents into a compact context block."""
-        parts = []
-        for i, doc in enumerate(docs, 1):
-            parts.append(
-                f"--- Document {i} "
-                f"(hybrid_score={doc.get('hybrid_score', 0):.3f}) ---\n"
-                f"{doc['context'][:300]}"
+            chunks = self.retriever.retrieve_for_example(
+                question=question,
+                example=state["example"],
+                k=config.agent.retrieval_top_k,
             )
-        return "\n\n".join(parts)
+            state["retrieved_chunks"] = chunks
+            state["trace"].append(
+                {
+                    "node": "retrieve",
+                    "retrieved_chunk_ids": [chunk["chunk_id"] for chunk in chunks],
+                    "top_hybrid_score": chunks[0]["hybrid_score"] if chunks else None,
+                }
+            )
+
+        self._record_node_trace(state, "retrieve", start, status="ok")
+        return state
 
     def _reason_node(self, state: AgentState) -> AgentState:
-        """
-        Send question + retrieved context to the LLM for step-by-step reasoning.
-
-        On retry runs (failure_feedback is set):
-        - Increments retry_count
-        - Resets previous verification state for a clean slate
-        - Injects the verifier's issues into the prompt so the LLM can correct them
-        """
-        question = state["question"]
-        failure_feedback = state.get("failure_feedback")
-        is_retry = failure_feedback is not None
-        _t0 = time.perf_counter()
-
-        if is_retry:
+        start = time.perf_counter()
+        feedback = state["failure_feedback"] or "NONE"
+        if state["verification_status"] == "FAIL":
             state["retry_count"] += 1
-            # Reset verification fields so the new attempt starts clean
-            state["verification_status"] = "SKIPPED"
-            state["verification_issues"] = []
-            state["verification_confidence"] = "N/A"
 
-        attempt_num = state["retry_count"] + 1  # 1-based for display
-        context_str = self._format_context(state["retrieved_docs"])
-
-        retry_block = ""
-        if is_retry:
-            retry_block = (
-                f"\n\n--- CORRECTION REQUIRED (Attempt {attempt_num} of {MAX_RETRIES + 1}) ---\n"
-                f"Your previous reasoning was rejected by the verifier. Issues found:\n"
-                f"{failure_feedback}\n"
-                "Please carefully re-examine the documents and correct these specific problems."
-            )
-
-        user_prompt = (
-            f"Question: {question}\n\n"
-            f"Retrieved Financial Documents:\n{context_str}"
-            f"{retry_block}\n\n"
-            "Please analyze the documents and reason step by step."
-        )
+        evidence = self._format_evidence(state["retrieved_chunks"])
+        evidence = evidence[: config.agent.max_context_characters]
 
         with LoggerContext(
-            logger, "reason_node",
-            question=question,
-            attempt=attempt_num,
-            is_retry=is_retry,
-            model=self.model,
-        ):
-            try:
-                response = self.llm.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": REASON_SYSTEM},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_tokens=256,  # Reduced for 2048 token limit
-                    temperature=config.vllm.temperature,
-                )
-                reasoning_text = response.choices[0].message.content or ""
-            except Exception as e:
-                logger.error("reason_llm_failed", error=str(e))
-                reasoning_text = (
-                    "REASONING:\nLLM endpoint unavailable.\n\n"
-                    "CALCULATION:\nNONE\n\n"
-                    f"PRELIMINARY_ANSWER:\nLLM error: {e}"
-                )
-
-        calc_expr = _parse_calculation(reasoning_text)
-
-        state["reasoning"] = reasoning_text
-        state["calculation_expression"] = calc_expr
-        state["trace"].append({
-            "node": "reason",
-            "attempt": attempt_num,
-            "is_retry": is_retry,
-            "reasoning_preview": reasoning_text[:400],
-            "calculation_expression": calc_expr,
-        })
-        state["node_traces"].append({"node": "reason", "attempt": attempt_num, "duration_ms": round((time.perf_counter() - _t0) * 1000, 2), "status": "ok"})
-
-        return state
-
-    # -----------------------------------------------------------------------
-    # Node: calculator
-    # -----------------------------------------------------------------------
-
-    def _calculator_node(self, state: AgentState) -> AgentState:
-        """Safely evaluate the arithmetic expression extracted from reasoning."""
-        expr = state.get("calculation_expression")
-        _t0 = time.perf_counter()
-
-        with LoggerContext(logger, "calculator_node", expression=expr):
-            if not expr:
-                state["calculation_result"] = None
-                state["trace"].append({"node": "calculator", "skipped": True, "reason": "no_expression"})
-                state["node_traces"].append({"node": "calculator", "duration_ms": round((time.perf_counter() - _t0) * 1000, 2), "status": "skipped"})
-                return state
-
-            result_str = _evaluate_expression(expr)
-            logger.info("calculation_result", expression=expr, result=result_str)
-
-            state["calculation_result"] = result_str
-            state["trace"].append({
-                "node": "calculator",
-                "expression": expr,
-                "result": result_str,
-            })
-
-        state["node_traces"].append({"node": "calculator", "duration_ms": round((time.perf_counter() - _t0) * 1000, 2), "status": "ok"})
-        return state
-
-    # -----------------------------------------------------------------------
-    # Node: verifier
-    # -----------------------------------------------------------------------
-
-    def _verifier_node(self, state: AgentState) -> AgentState:
-        """
-        Check that reasoning and calculation are consistent with retrieved docs.
-
-        Also sets:
-        - failure_feedback: formatted issues string when status is FAIL
-        - retry_exhausted: True when FAIL and no retries remain
-        """
-        question = state["question"]
-        reasoning = state["reasoning"]
-        calc_expr = state.get("calculation_expression")
-        calc_result = state.get("calculation_result")
-        context_str = self._format_context(state["retrieved_docs"])
-        _t0 = time.perf_counter()
-
-        calc_block = ""
-        if calc_expr:
-            calc_block = f"\nCalculation performed: {calc_expr} = {calc_result}"
-
-        user_prompt = (
-            f"Question: {question}\n\n"
-            f"Retrieved Financial Documents (source of truth):\n{context_str}\n\n"
-            f"Reasoning produced:\n{reasoning}"
-            f"{calc_block}\n\n"
-            "Please verify whether the reasoning and numbers are consistent with the documents."
-        )
-
-        with LoggerContext(logger, "verifier_node", question=question, model=self.model):
-            try:
-                response = self.llm.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": VERIFY_SYSTEM},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_tokens=512,
-                    temperature=0.0,
-                )
-                verify_text = response.choices[0].message.content or ""
-            except Exception as e:
-                logger.error("verifier_llm_failed", error=str(e))
-                verify_text = (
-                    "VERIFICATION_STATUS: UNCERTAIN\n"
-                    "CONFIDENCE: LOW\n"
-                    f"ISSUES:\n- Verifier LLM call failed: {e}"
-                )
-
-        status, confidence, issues = _parse_verification(verify_text)
-
-        # Build failure_feedback for the next reason attempt
-        if status == "FAIL":
-            state["failure_feedback"] = "\n".join(f"- {i}" for i in issues) if issues else "- Unspecified verification failure"
-        else:
-            state["failure_feedback"] = None
-
-        # Mark exhausted when this FAIL would exceed the retry budget
-        state["retry_exhausted"] = (status == "FAIL" and state["retry_count"] >= MAX_RETRIES)
-
-        logger.info(
-            "verification_completed",
-            status=status,
-            confidence=confidence,
-            num_issues=len(issues),
+            logger,
+            "reason_node",
+            question=state["question"],
             retry_count=state["retry_count"],
-            retry_exhausted=state["retry_exhausted"],
+        ):
+            prompt = REASON_PROMPT.invoke(
+                {
+                    "question": state["question"],
+                    "evidence": evidence,
+                    "feedback": feedback,
+                }
+            )
+            response = self.llm.invoke(prompt)
+            content = response.content if isinstance(response.content, str) else str(response.content)
+
+        reasoning, prelim, calc_expr, evidence_ids = _parse_reasoning_output(content)
+        state["reasoning"] = reasoning
+        state["preliminary_answer"] = prelim
+        state["calculation_expression"] = calc_expr
+        state["cited_evidence_ids"] = evidence_ids
+        state["trace"].append(
+            {
+                "node": "reason",
+                "retry_count": state["retry_count"],
+                "calculation_expression": calc_expr,
+                "preliminary_answer": prelim,
+                "cited_evidence_ids": evidence_ids,
+            }
         )
+        self._record_node_trace(
+            state,
+            "reason",
+            start,
+            status="ok",
+            retry_count=state["retry_count"],
+        )
+        return state
+
+    def _calculate_node(self, state: AgentState) -> AgentState:
+        start = time.perf_counter()
+        expr = state["calculation_expression"]
+        if not expr:
+            state["calculation_result"] = None
+            state["trace"].append({"node": "calculate", "skipped": True})
+            self._record_node_trace(state, "calculate", start, status="skipped")
+            return state
+
+        result = _evaluate_expression(expr)
+        state["calculation_result"] = result
+        state["trace"].append(
+            {
+                "node": "calculate",
+                "expression": expr,
+                "result": result,
+            }
+        )
+        self._record_node_trace(state, "calculate", start, status="ok")
+        return state
+
+    def _verify_node(self, state: AgentState) -> AgentState:
+        start = time.perf_counter()
+        evidence = self._format_evidence(state["retrieved_chunks"])
+        evidence = evidence[: config.agent.max_context_characters]
+
+        with LoggerContext(
+            logger,
+            "verify_node",
+            question=state["question"],
+            retry_count=state["retry_count"],
+        ):
+            prompt = VERIFY_PROMPT.invoke(
+                {
+                    "question": state["question"],
+                    "evidence": evidence,
+                    "reasoning": state["reasoning"],
+                    "calculation_result": state["calculation_result"] or "NONE",
+                }
+            )
+            response = self.llm.invoke(prompt)
+            content = response.content if isinstance(response.content, str) else str(response.content)
+
+        status, confidence, issues = _parse_verification_output(content)
+        heuristic_issues = _run_heuristic_checks(
+            reasoning=state["reasoning"],
+            calculation_expression=state["calculation_expression"],
+            calculation_result=state["calculation_result"],
+            preliminary_answer=state["preliminary_answer"],
+            retrieved_chunks=state["retrieved_chunks"],
+        )
+        merged_issues = list(dict.fromkeys(issues + heuristic_issues))
+
+        if heuristic_issues and status == "PASS":
+            status = "FAIL"
+            confidence = "MEDIUM"
 
         state["verification_status"] = status
         state["verification_confidence"] = confidence
-        state["verification_issues"] = issues
-        state["trace"].append({
-            "node": "verifier",
-            "attempt": state["retry_count"] + 1,
-            "status": status,
-            "confidence": confidence,
-            "issues": issues,
-            "retry_exhausted": state["retry_exhausted"],
-            "raw_preview": verify_text[:300],
-        })
-        state["node_traces"].append({"node": "verifier", "attempt": state["retry_count"] + 1, "duration_ms": round((time.perf_counter() - _t0) * 1000, 2), "status": status.lower()})
-
+        state["verification_issues"] = merged_issues
+        state["failure_feedback"] = "\n".join(f"- {issue}" for issue in merged_issues) or "NONE"
+        state["trace"].append(
+            {
+                "node": "verify",
+                "status": status,
+                "confidence": confidence,
+                "issues": merged_issues,
+            }
+        )
+        self._record_node_trace(state, "verify", start, status=status.lower())
         return state
-
-    # -----------------------------------------------------------------------
-    # Node: answer
-    # -----------------------------------------------------------------------
 
     def _answer_node(self, state: AgentState) -> AgentState:
-        """
-        Produce the final answer with tone scaled to verification outcome:
-
-          PASS + HIGH     → CONFIDENT  — direct answer
-          PASS + MEDIUM   → CAVEAT     — answer with light caveat
-          UNCERTAIN       → HUMAN_REVIEW — flagged for human review
-          retries exhausted → MAX_RETRIES — low-confidence warning
-        """
-        question = state["question"]
-        calc_result = state.get("calculation_result")
-        v_status = state["verification_status"]
-        v_confidence = state["verification_confidence"]
-        retry_exhausted = state["retry_exhausted"]
-
-        mode = _answer_mode(v_status, v_confidence, retry_exhausted)
-        mode_instruction = _ANSWER_MODE_INSTRUCTIONS[mode]
-        _t0 = time.perf_counter()
-
-        calc_line = f"\nCalculation Result: {calc_result}" if calc_result else ""
-        issues_line = ""
-        if state["verification_issues"] and v_status != "PASS":
-            issues_line = "\nVerification Issues:\n" + "\n".join(
-                f"- {i}" for i in state["verification_issues"]
-            )
-        retry_line = f"\nRetry attempts used: {state['retry_count']} / {MAX_RETRIES}"
-
-        user_prompt = (
-            f"Question: {question}\n\n"
-            f"Reasoning Trace:\n{state['reasoning']}"
-            f"{calc_line}\n\n"
-            f"Verification: {v_status} (Confidence: {v_confidence})"
-            f"{issues_line}"
-            f"{retry_line}\n\n"
-            f"Instruction: {mode_instruction}"
-        )
-
+        start = time.perf_counter()
         with LoggerContext(
-            logger, "answer_node",
-            question=question,
-            verification_status=v_status,
-            answer_mode=mode,
+            logger,
+            "answer_node",
+            question=state["question"],
+            verification_status=state["verification_status"],
         ):
-            try:
-                response = self.llm.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": ANSWER_SYSTEM},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    max_tokens=256,
-                    temperature=0.0,
-                )
-                answer_text = response.choices[0].message.content or ""
-            except Exception as e:
-                logger.error("answer_llm_failed", error=str(e))
-                answer_text = _fallback_answer(state["reasoning"], calc_result, e)
+            prompt = ANSWER_PROMPT.invoke(
+                {
+                    "question": state["question"],
+                    "reasoning": state["reasoning"],
+                    "preliminary_answer": state["preliminary_answer"] or "NONE",
+                    "calculation_result": state["calculation_result"] or "NONE",
+                    "verification_status": state["verification_status"],
+                    "verification_confidence": state["verification_confidence"],
+                    "verification_issues": "\n".join(
+                        f"- {issue}" for issue in state["verification_issues"]
+                    )
+                    or "- NONE",
+                }
+            )
+            response = self.llm.invoke(prompt)
+            content = response.content if isinstance(response.content, str) else str(response.content)
 
-        state["final_answer"] = answer_text
-        state["trace"].append({
-            "node": "answer",
-            "answer_mode": mode,
-            "final_answer": answer_text,
-        })
-        state["node_traces"].append({"node": "answer", "answer_mode": mode, "duration_ms": round((time.perf_counter() - _t0) * 1000, 2), "status": "ok"})
-
+        state["final_answer"] = content
+        state["trace"].append({"node": "answer", "final_answer": content})
+        self._record_node_trace(state, "answer", start, status="ok")
         return state
 
-    # -----------------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------------
-
-    def load_index(self) -> bool:
-        """Load the saved retriever index. Returns True on success."""
-        with LoggerContext(logger, "load_retriever_index"):
-            loaded = self.retriever.load_index()
-        return loaded
-
-    def run(self, question: str) -> Dict[str, Any]:
-        """Run the full agent workflow and return the complete state."""
+    def run(self, question: str, example: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the workflow for a question plus its financial document."""
         initial_state: AgentState = {
             "question": question,
-            "retrieved_docs": [],
+            "example": example,
+            "retrieved_chunks": [],
             "reasoning": "",
+            "preliminary_answer": "",
+            "cited_evidence_ids": [],
             "calculation_expression": None,
             "calculation_result": None,
             "verification_status": "SKIPPED",
-            "verification_issues": [],
             "verification_confidence": "N/A",
+            "verification_issues": [],
             "retry_count": 0,
-            "failure_feedback": None,
-            "retry_exhausted": False,
+            "failure_feedback": "",
             "final_answer": "",
             "trace": [],
             "node_traces": [],
         }
 
         with LoggerContext(logger, "agent_run", question=question):
-            result = self.graph.invoke(initial_state)
-
-        return result
+            return self.graph.invoke(initial_state)
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers (no state mutation)
-# ---------------------------------------------------------------------------
+def _extract_block(text: str, start_label: str, end_labels: List[str]) -> str:
+    if end_labels:
+        end_pattern = "|".join(map(re.escape, end_labels))
+        pattern = rf"{re.escape(start_label)}\s*\n(.*?)(?=\n(?:{end_pattern})\s*\n|\Z)"
+    else:
+        pattern = rf"{re.escape(start_label)}\s*\n(.*)"
+    match = re.search(pattern, text, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
-def _parse_calculation(text: str) -> Optional[str]:
-    """Extract the CALCULATION expression from LLM output."""
-    match = re.search(
-        r"CALCULATION:\s*\n(.+?)(?:\n\nPRELIMINARY|\n\nREASONING|\Z)",
+
+def _parse_reasoning_output(text: str) -> Tuple[str, str, Optional[str], List[str]]:
+    reasoning = _extract_block(
         text,
-        re.DOTALL,
+        "REASONING:",
+        ["CALCULATION:", "PRELIMINARY_ANSWER:", "EVIDENCE_IDS:"],
     )
-    if not match:
-        return None
-    expr = match.group(1).strip()
-    return None if expr.upper() == "NONE" or not expr else expr
+    calculation = _extract_block(
+        text,
+        "CALCULATION:",
+        ["PRELIMINARY_ANSWER:", "EVIDENCE_IDS:"],
+    )
+    preliminary_answer = _extract_block(
+        text,
+        "PRELIMINARY_ANSWER:",
+        ["EVIDENCE_IDS:"],
+    )
+    evidence_block = _extract_block(text, "EVIDENCE_IDS:", [])
+    evidence_ids = [
+        line.strip().lstrip("- ").strip()
+        for line in evidence_block.splitlines()
+        if line.strip()
+    ]
+
+    calculation = calculation.strip()
+    if not calculation or calculation.upper() == "NONE":
+        calculation = None
+
+    return reasoning, preliminary_answer, calculation, evidence_ids
 
 
-def _parse_verification(text: str) -> Tuple[str, str, List[str]]:
-    """Extract (status, confidence, issues) from verifier LLM output."""
-    status_match = re.search(r"VERIFICATION_STATUS:\s*(PASS|FAIL|UNCERTAIN)", text, re.IGNORECASE)
-    status = status_match.group(1).upper() if status_match else "UNCERTAIN"
+def _parse_verification_output(text: str) -> Tuple[str, str, List[str]]:
+    status_match = re.search(r"VERIFICATION_STATUS:\s*(PASS|FAIL|UNCERTAIN)", text)
+    confidence_match = re.search(r"CONFIDENCE:\s*(HIGH|MEDIUM|LOW)", text)
+    issues_block = _extract_block(text, "ISSUES:", [])
 
-    conf_match = re.search(r"CONFIDENCE:\s*(HIGH|MEDIUM|LOW)", text, re.IGNORECASE)
-    confidence = conf_match.group(1).upper() if conf_match else "LOW"
+    issues = []
+    for line in issues_block.splitlines():
+        cleaned = line.strip().lstrip("- ").strip()
+        if cleaned and cleaned.upper() != "NONE":
+            issues.append(cleaned)
 
-    issues: List[str] = []
-    issues_match = re.search(r"ISSUES:\s*\n((?:- .+\n?)+)", text, re.IGNORECASE)
-    if issues_match:
-        for line in issues_match.group(1).splitlines():
-            line = line.strip().lstrip("- ").strip()
-            if line and line.upper() != "NONE":
-                issues.append(line)
-
-    return status, confidence, issues
+    return (
+        status_match.group(1) if status_match else "UNCERTAIN",
+        confidence_match.group(1) if confidence_match else "LOW",
+        issues,
+    )
 
 
 def _evaluate_expression(expr: str) -> str:
-    """Evaluate an arithmetic expression safely using sympy or restricted eval."""
     try:
+        if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.]+", expr):
+            raise ValueError(f"Unsafe expression refused: {expr}")
+
         if SYMPY_AVAILABLE:
             result = float(N(sympify(expr)))
         else:
-            if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.]+", expr):
-                raise ValueError(f"Unsafe expression refused: {expr}")
             result = float(eval(expr))  # noqa: S307
         return str(round(result, 6))
-    except Exception as e:
-        return f"Error: {e}"
+    except Exception as exc:  # pragma: no cover - defensive path
+        return f"ERROR: {exc}"
 
 
-def _fallback_answer(reasoning: str, calc_result: Optional[str], error: Exception) -> str:
-    """Build a fallback answer when the LLM answer call fails."""
-    if calc_result and not calc_result.startswith("Error"):
-        return (
-            f"FINAL_ANSWER: {calc_result}\n"
-            "EXPLANATION: Computed from retrieved financial data (LLM answer node unavailable)."
-        )
-    prelim_match = re.search(r"PRELIMINARY_ANSWER:\s*(.+)", reasoning, re.DOTALL)
-    prelim = prelim_match.group(1).strip()[:200] if prelim_match else "Unknown"
-    return (
-        f"FINAL_ANSWER: {prelim}\n"
-        f"EXPLANATION: Derived from documents; LLM answer node failed: {error}"
-    )
+def _extract_numbers(text: str) -> List[str]:
+    return re.findall(r"-?\d+(?:\.\d+)?", text)
 
 
-# ---------------------------------------------------------------------------
-# Main — demo run
-# ---------------------------------------------------------------------------
+def _run_heuristic_checks(
+    reasoning: str,
+    calculation_expression: Optional[str],
+    calculation_result: Optional[str],
+    preliminary_answer: str,
+    retrieved_chunks: List[Dict[str, Any]],
+) -> List[str]:
+    issues: List[str] = []
+    evidence_text = " ".join(chunk["text"] for chunk in retrieved_chunks).lower().replace(",", "")
+
+    if calculation_expression:
+        for number in _extract_numbers(calculation_expression):
+            if number in {"100", "1000"}:
+                continue
+            if number.replace(",", "") not in evidence_text:
+                issues.append(f"Calculation uses unsupported number {number}.")
+
+    if calculation_result and not calculation_result.startswith("ERROR"):
+        prelim_num = _extract_first_number(preliminary_answer)
+        calc_num = _extract_first_number(calculation_result)
+        if prelim_num is not None and calc_num is not None and abs(prelim_num - calc_num) > 0.01:
+            issues.append("Preliminary answer does not match the computed result.")
+
+    if calculation_result and calculation_result.startswith("ERROR"):
+        issues.append("Calculation step failed to execute safely.")
+
+    if not retrieved_chunks:
+        issues.append("No evidence chunks were retrieved.")
+
+    return issues
+
+
+def _extract_first_number(text: str) -> Optional[float]:
+    match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        return float(match.group())
+    except ValueError:
+        return None
+
 
 if __name__ == "__main__":
-    import argparse
+    from src.data_loader import load_finqa_dataset
 
-    parser = argparse.ArgumentParser(description="FinQA Agent - Financial Question Answering with LangGraph")
-    parser.add_argument(
-        "--question",
-        type=str,
-        default="what is the interest expense in 2009?",
-        help="Question to ask the agent (default: 'what is the interest expense in 2009?')"
-    )
-    args = parser.parse_args()
-
-    print("\n" + "=" * 80)
-    print("FinQA Agent — LangGraph Workflow Demo")
-    print("=" * 80)
-
+    dataset = load_finqa_dataset(split="validation")
+    example = dataset[0]
     agent = FinQAAgent()
-
-    print("\nLoading hybrid retriever index...")
-    if not agent.load_index():
-        print("No saved index found. Building index first (this will take a few minutes)...")
-        agent.retriever.build_index()
-        print("Index built successfully.")
-    else:
-        print("Hybrid FAISS + BM25 index loaded successfully.")
-
-    print(f"\nQuestion: {args.question}\n")
-
-    result = agent.run(args.question)
-
-    # ── Print full reasoning trace ──────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print("FULL REASONING TRACE")
-    print("=" * 80)
-
-    for step in result["trace"]:
-        node = step.get("node", "?")
-        attempt = step.get("attempt", "")
-        attempt_label = f" (attempt {attempt})" if attempt else ""
-        print(f"\n{'─' * 60}")
-        print(f"NODE: {node.upper()}{attempt_label}")
-        print(f"{'─' * 60}")
-
-        if node == "retrieve":
-            print(f"  Documents retrieved : {step['num_docs']}")
-            print(f"  Top hybrid score    : {step.get('top_hybrid_score', 'N/A'):.4f}")
-            print("  Retrieved questions :")
-            for q in step.get("retrieved_questions", []):
-                print(f"    • {q}")
-
-        elif node == "reason":
-            print(f"  Is retry            : {step.get('is_retry', False)}")
-            print(f"  Calculation expr    : {step.get('calculation_expression') or 'NONE'}")
-            print("\n  Reasoning preview:\n")
-            for line in step.get("reasoning_preview", "").split("\n"):
-                print(f"    {line}")
-            print("    ...")
-
-        elif node == "calculator":
-            if step.get("skipped"):
-                print(f"  Skipped             : {step.get('reason', '')}")
-            else:
-                print(f"  Expression          : {step.get('expression')}")
-                print(f"  Result              : {step.get('result')}")
-
-        elif node == "verifier":
-            status = step.get("status", "?")
-            icon = {"PASS": "✓", "FAIL": "✗", "UNCERTAIN": "~"}.get(status, "?")
-            print(f"  Status              : {icon} {status}")
-            print(f"  Confidence          : {step.get('confidence', 'N/A')}")
-            print(f"  Retry exhausted     : {step.get('retry_exhausted', False)}")
-            issues = step.get("issues", [])
-            if issues:
-                print("  Issues detected     :")
-                for issue in issues:
-                    print(f"    ✗ {issue}")
-            else:
-                print("  Issues detected     : none")
-
-        elif node == "answer":
-            print(f"  Answer mode         : {step.get('answer_mode', 'N/A')}")
-            print("\n  Final Answer:\n")
-            for line in step.get("final_answer", "").split("\n"):
-                print(f"    {line}")
-
-    # ── Node execution timeline ────────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print("NODE EXECUTION TIMELINE")
-    print("=" * 80)
-    print(f"  {'Node':<12} {'Attempt':<9} {'Duration':>10}    Status")
-    print(f"  {'─'*12} {'─'*9} {'─'*10}    {'─'*10}")
-    total_ms = 0.0
-    for nt in result["node_traces"]:
-        attempt_col = str(nt["attempt"]) if "attempt" in nt else "-"
-        dur = nt["duration_ms"]
-        total_ms += dur
-        print(f"  {nt['node']:<12} {attempt_col:<9} {dur:>9.1f}ms   {nt['status']}")
-    print(f"  {'─'*12} {'─'*9} {'─'*10}")
-    print(f"  {'TOTAL':<12} {'':9} {total_ms:>9.1f}ms")
-
-    # ── Summary ────────────────────────────────────────────────────────────
-    print("\n" + "=" * 80)
-    print("FINAL ANSWER SUMMARY")
-    print("=" * 80)
-    print(f"\nQuestion             : {result['question']}")
-    print(f"Retries used         : {result['retry_count']} / {MAX_RETRIES}")
-    print(f"Retry exhausted      : {result['retry_exhausted']}")
-    print(f"Verification Status  : {result['verification_status']} "
-          f"(Confidence: {result['verification_confidence']})")
-    if result["verification_issues"]:
-        print("Verification Issues  :")
-        for issue in result["verification_issues"]:
-            print(f"  ✗ {issue}")
-    print(f"\n{result['final_answer']}")
-    if result.get("calculation_result"):
-        print(f"\nCalculation : {result['calculation_expression']} = {result['calculation_result']}")
-
-    print("\n" + "=" * 80)
-    print("AGENT RUN COMPLETE")
-    print("=" * 80 + "\n")
+    result = agent.run(example["question"], example)
+    print(result["final_answer"])

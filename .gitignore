@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 .vscode/
+node_modules
+node_modules/
 
 # Data directories
 data/

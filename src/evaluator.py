@@ -1,498 +1,320 @@
-"""
-FinQA Agent Evaluator
+"""Evaluation utilities for the FinQA chatbot."""
 
-Evaluates agent performance on validation set examples.
-"""
+from __future__ import annotations
 
 import json
 import re
 import time
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Union
+from collections import Counter
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.agent import FinQAAgent
 from src.data_loader import load_finqa_dataset
 from src.logger import get_logger
+from src.retriever import FinQARetriever
 
 logger = get_logger(__name__)
 
 
+PROGRAM_OPERATORS = (
+    "add",
+    "subtract",
+    "multiply",
+    "divide",
+    "exp",
+    "greater",
+    "table_max",
+    "table_min",
+    "table_sum",
+    "table_average",
+)
+
+
 class FinQAEvaluator:
-    """Evaluator for FinQA agent performance."""
+    """Runs FinQA evaluation and aggregates answer, retrieval, and reasoning metrics."""
 
-    def __init__(self, output_path: str = "data/eval_results.json"):
-        """
-        Initialize evaluator.
-
-        Args:
-            output_path: Path to save evaluation results
-        """
+    def __init__(self, output_path: str = "data/eval_results.json") -> None:
         self.output_path = Path(output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.agent = None  # Lazy init
+        self.agent: Optional[FinQAAgent] = None
+        self.retriever = FinQARetriever()
 
-    def _init_agent(self):
-        """Initialize agent and load index."""
+    def _init_agent(self) -> None:
         if self.agent is None:
-            print("\nInitializing agent and loading retriever index...")
             self.agent = FinQAAgent()
-            if not self.agent.load_index():
-                print("Error: Index not found. Building index first...")
-                self.agent.retriever.build_index()
-                self.agent.retriever.save_index()
-                print("Index built successfully.")
-            else:
-                print("Index loaded successfully.")
 
-    def normalize_string(self, text: str) -> str:
-        """
-        Normalize string for comparison.
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        cleaned = text.lower().strip()
+        cleaned = re.sub(r"[\$,]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned
 
-        Args:
-            text: Input text
+    @staticmethod
+    def _extract_final_answer(text: str) -> str:
+        match = re.search(r"FINAL_ANSWER:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+        return match.group(1).strip() if match else text.strip()
 
-        Returns:
-            Normalized string (lowercase, stripped, no $, %, commas)
-        """
-        if not text:
-            return ""
-        # Remove $ % , and whitespace, convert to lowercase
-        normalized = text.lower().strip()
-        normalized = re.sub(r'[\$%,]', '', normalized)
-        return normalized
+    @staticmethod
+    def _parse_numeric_value(text: str) -> Tuple[Optional[float], Optional[str]]:
+        normalized = text.lower().replace(",", "").strip()
+        multiplier = 1.0
+        unit = "absolute"
 
-    def extract_number(self, text: str) -> Optional[float]:
-        """
-        Extract numeric value from text.
+        if "%" in normalized or "percent" in normalized:
+            unit = "percent"
+        elif "billion" in normalized or re.search(r"\b\d+(\.\d+)?b\b", normalized):
+            multiplier = 1_000_000_000.0
+        elif "million" in normalized or re.search(r"\b\d+(\.\d+)?m\b", normalized):
+            multiplier = 1_000_000.0
+        elif "thousand" in normalized or re.search(r"\b\d+(\.\d+)?k\b", normalized):
+            multiplier = 1_000.0
 
-        Handles formats like: "45.0", "$45M", "45%", "-45.0", etc.
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if not match:
+            return None, unit
 
-        Args:
-            text: Text containing number
-
-        Returns:
-            Extracted number or None
-        """
-        if not text:
-            return None
-
-        # Normalize
-        text = self.normalize_string(text)
-
-        # Try to find a number (including negative and decimals)
-        match = re.search(r'-?\d+\.?\d*', text)
-        if match:
-            try:
-                return float(match.group())
-            except (ValueError, AttributeError):
-                return None
-
-        return None
-
-    def extract_final_answer(self, agent_output: str) -> str:
-        """
-        Extract final answer from agent output.
-
-        Looks for "FINAL_ANSWER: <answer>" pattern.
-
-        Args:
-            agent_output: Full agent output string
-
-        Returns:
-            Extracted answer or full output if pattern not found
-        """
-        if not agent_output:
-            return ""
-
-        # Try to find "FINAL_ANSWER: <value>" pattern
-        match = re.search(r'FINAL_ANSWER:\s*(.+?)(?:\n|$)', agent_output, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-
-        # If no pattern found, return full output
-        return agent_output.strip()
+        try:
+            return float(match.group()) * multiplier, unit
+        except ValueError:
+            return None, unit
 
     def compare_answers(
         self,
         predicted: str,
-        gold: Union[str, float],
-        tolerance: float = 0.01
+        gold: str,
+        tolerance: float = 0.01,
     ) -> Dict[str, bool]:
-        """
-        Compare predicted answer to gold answer.
+        predicted_clean = self._extract_final_answer(predicted)
+        pred_norm = self._normalize_text(predicted_clean)
+        gold_norm = self._normalize_text(gold)
 
-        Args:
-            predicted: Predicted answer string
-            gold: Gold standard answer (str or float)
-            tolerance: Numeric tolerance (default 1%)
-
-        Returns:
-            Dictionary with exact_match, numeric_match, tolerance_match flags
-        """
-        result = {
-            "exact_match": False,
+        metrics = {
+            "exact_match": pred_norm == gold_norm,
             "numeric_match": False,
             "tolerance_match": False,
         }
 
-        # Convert gold to string if needed
-        gold_str = str(gold)
+        pred_num, pred_unit = self._parse_numeric_value(predicted_clean)
+        gold_num, gold_unit = self._parse_numeric_value(gold)
 
-        # Extract final answer if it's in agent format
-        predicted_clean = self.extract_final_answer(predicted)
-
-        # Exact match (normalized strings)
-        pred_norm = self.normalize_string(predicted_clean)
-        gold_norm = self.normalize_string(gold_str)
-
-        if pred_norm == gold_norm:
-            result["exact_match"] = True
-            result["numeric_match"] = True
-            result["tolerance_match"] = True
-            return result
-
-        # Try numeric comparison
-        pred_num = self.extract_number(predicted_clean)
-        gold_num = self.extract_number(gold_str)
-
-        if pred_num is not None and gold_num is not None:
-            # Numeric match (exact within floating point precision)
+        if pred_num is not None and gold_num is not None and pred_unit == gold_unit:
             if abs(pred_num - gold_num) < 1e-6:
-                result["numeric_match"] = True
-                result["tolerance_match"] = True
-            # Tolerance match (within 1%)
+                metrics["numeric_match"] = True
+                metrics["tolerance_match"] = True
             else:
-                denominator = max(abs(gold_num), 1e-8)  # Avoid division by zero
-                error = abs(pred_num - gold_num) / denominator
-                if error <= tolerance:
-                    result["tolerance_match"] = True
+                denominator = max(abs(gold_num), 1e-8)
+                relative_error = abs(pred_num - gold_num) / denominator
+                metrics["tolerance_match"] = relative_error <= tolerance
 
-        return result
+        return metrics
 
-    def evaluate_example(self, example: Dict[str, Any], example_idx: int) -> Dict[str, Any]:
-        """
-        Evaluate agent on a single example.
+    @staticmethod
+    def _program_ops(program: str) -> List[str]:
+        return re.findall(r"(add|subtract|multiply|divide|exp|greater|table_max|table_min|table_sum|table_average)", program)
 
-        Args:
-            example: FinQA example dict
-            example_idx: Example index for logging
+    @staticmethod
+    def _expr_ops(expression: Optional[str]) -> List[str]:
+        if not expression:
+            return []
+        mapping = {
+            "+": "add",
+            "-": "subtract",
+            "*": "multiply",
+            "/": "divide",
+        }
+        return [mapping[token] for token in re.findall(r"[\+\-\*/]", expression) if token in mapping]
 
-        Returns:
-            Evaluation result dictionary
-        """
-        # Extract fields
-        question = example.get("question", "")
-        gold_answer = example.get("answer", "")
-        gold_program = example.get("program", "")
-        gold_exe_ans = example.get("exe_ans", "")
+    def evaluate_example(self, example: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        question = example["question"]
+        gold_answer = str(example.get("exe_ans") or example.get("answer") or "")
+        gold_program = str(example.get("program") or "")
 
-        logger.info("evaluating_example", idx=example_idx, question=question[:80])
+        logger.info("evaluate_example_started", index=idx, question=question[:120])
 
-        # Run agent
-        try:
-            start_time = time.time()
-            result = self.agent.run(question)
-            latency_ms = (time.time() - start_time) * 1000
+        start_time = time.time()
+        result = self.agent.run(question, example)
+        latency_ms = (time.time() - start_time) * 1000
 
-            # Extract metrics from agent result
-            predicted_answer = result.get("final_answer", "")
-            verification_status = result.get("verification_status", "UNCERTAIN")
-            verification_confidence = result.get("verification_confidence", "LOW")
-            retry_count = result.get("retry_count", 0)
-            retry_exhausted = result.get("retry_exhausted", False)
+        answer_metrics = self.compare_answers(result["final_answer"], gold_answer)
+        retrieved_chunks = result.get("retrieved_chunks", [])
+        answer_support_at_k = self.retriever.answer_in_top_k(
+            example=example,
+            question=question,
+            k=min(5, max(len(retrieved_chunks), 1)),
+        )
 
-            # Check if calculator was used
-            calculator_used = False
-            for trace in result.get("trace", []):
-                if trace.get("node") == "calculator" and not trace.get("skipped"):
-                    calculator_used = True
-                    break
+        gold_ops = self._program_ops(gold_program)
+        predicted_ops = self._expr_ops(result.get("calculation_expression"))
 
-            # Compare answers (use exe_ans if available, else answer)
-            gold_for_comparison = gold_exe_ans if gold_exe_ans else gold_answer
-            comparison = self.compare_answers(predicted_answer, gold_for_comparison)
+        calculator_used = bool(result.get("calculation_expression"))
+        should_calculate = bool(gold_ops)
+        op_overlap = len(set(gold_ops) & set(predicted_ops))
+        op_union = len(set(gold_ops) | set(predicted_ops))
 
-            eval_result = {
-                "example_idx": example_idx,
-                "question": question,
-                "gold_answer": str(gold_answer),
-                "gold_program": gold_program,
-                "gold_exe_ans": str(gold_exe_ans),
-                "predicted_answer": predicted_answer,
-                "exact_match": comparison["exact_match"],
-                "numeric_match": comparison["numeric_match"],
-                "tolerance_match": comparison["tolerance_match"],
-                "verification_status": verification_status,
-                "verification_confidence": verification_confidence,
-                "retry_count": int(retry_count),
-                "retry_exhausted": bool(retry_exhausted),
-                "calculator_used": calculator_used,
-                "latency_ms": round(latency_ms, 2),
-                "error": None,
-            }
+        evaluation = {
+            "example_idx": idx,
+            "question": question,
+            "gold_answer": gold_answer,
+            "gold_program": gold_program,
+            "predicted_answer": result["final_answer"],
+            "predicted_calculation_expression": result.get("calculation_expression"),
+            "predicted_calculation_result": result.get("calculation_result"),
+            "retrieved_chunk_ids": [chunk["chunk_id"] for chunk in retrieved_chunks],
+            "retrieval_answer_support_at_5": answer_support_at_k,
+            "exact_match": answer_metrics["exact_match"],
+            "numeric_match": answer_metrics["numeric_match"],
+            "tolerance_match": answer_metrics["tolerance_match"],
+            "verification_status": result["verification_status"],
+            "verification_confidence": result["verification_confidence"],
+            "retry_count": result["retry_count"],
+            "calculator_used": calculator_used,
+            "gold_requires_calculation": should_calculate,
+            "operator_match": set(gold_ops) == set(predicted_ops) if gold_ops or predicted_ops else True,
+            "operator_jaccard": round((op_overlap / op_union), 4) if op_union else 1.0,
+            "latency_ms": round(latency_ms, 2),
+        }
 
-            logger.info(
-                "example_evaluated",
-                idx=example_idx,
-                tolerance_match=comparison["tolerance_match"],
-                retries=retry_count,
-                latency_ms=round(latency_ms, 2)
-            )
+        logger.info(
+            "evaluate_example_completed",
+            index=idx,
+            tolerance_match=evaluation["tolerance_match"],
+            retrieval_answer_support_at_5=answer_support_at_k,
+            operator_jaccard=evaluation["operator_jaccard"],
+        )
+        return evaluation
 
-        except Exception as e:
-            logger.error(
-                "evaluation_error",
-                idx=example_idx,
-                question=question[:80],
-                error=str(e),
-            )
-            eval_result = {
-                "example_idx": example_idx,
-                "question": question,
-                "gold_answer": str(gold_answer),
-                "gold_program": gold_program,
-                "gold_exe_ans": str(gold_exe_ans),
-                "predicted_answer": None,
-                "exact_match": False,
-                "numeric_match": False,
-                "tolerance_match": False,
-                "verification_status": "ERROR",
-                "verification_confidence": "LOW",
-                "retry_count": 0,
-                "retry_exhausted": False,
-                "calculator_used": False,
-                "latency_ms": 0.0,
-                "error": str(e),
-            }
-
-        return eval_result
-
-    def evaluate(self, num_examples: int = 20) -> Dict[str, Any]:
-        """
-        Evaluate agent on validation set.
-
-        Args:
-            num_examples: Number of examples to evaluate
-
-        Returns:
-            Evaluation results with metrics
-        """
-        logger.info("evaluation_started", num_examples=num_examples)
-
-        # Initialize agent
+    def evaluate(self, split: str = "validation", num_examples: int = 50) -> Dict[str, Any]:
+        logger.info("evaluation_started", split=split, num_examples=num_examples)
         self._init_agent()
 
-        # Load validation set
-        print(f"\nLoading {num_examples} validation examples...")
-        val_dataset = load_finqa_dataset(split="validation")
+        dataset = load_finqa_dataset(split=split)
+        examples = [dataset[i] for i in range(min(num_examples, len(dataset)))]
 
-        # Get individual examples
-        # HuggingFace Dataset: iterate directly or use select()
-        examples = []
-        for i in range(min(num_examples, len(val_dataset))):
-            example = val_dataset[i]
-            examples.append(example)
-
-        print(f"Loaded {len(examples)} examples from validation set")
-
-        # Debug: Check first example structure
-        if len(examples) > 0:
-            print(f"\nDebug - First example type: {type(examples[0])}")
-            print(f"Debug - First example keys: {examples[0].keys()}")
-            print(f"Debug - Sample question: {examples[0]['question'][:80]}...")
-
-        # Run a single test example first
-        if len(examples) > 0:
-            print("\nRunning test on first example...")
-            try:
-                test_result = self.evaluate_example(examples[0], 0)
-                print(f"✓ Test passed - predicted: {test_result['predicted_answer']}")
-                print(f"  Gold: {test_result['gold_answer']}")
-                print(f"  Match: {test_result['tolerance_match']}")
-            except Exception as e:
-                print(f"✗ Test failed: {e}")
-                raise
-
-        print(f"\nEvaluating {len(examples)} examples...\n")
-
-        # Evaluate each example
-        results = []
-        for i, example in enumerate(examples):
-            print(f"[{i+1}/{len(examples)}] {example['question'][:80]}...")
-
-            eval_result = self.evaluate_example(example, i)
-            results.append(eval_result)
-
-            # Print result
-            status = "✓" if eval_result["tolerance_match"] else "✗"
-            print(f"  {status} Predicted: {eval_result['predicted_answer']}")
-            print(f"    Gold: {eval_result['gold_answer']}")
-            if eval_result["error"]:
-                print(f"    Error: {eval_result['error']}")
-            print()
-
-        # Calculate metrics
+        results = [self.evaluate_example(example, idx) for idx, example in enumerate(examples)]
         metrics = self.calculate_metrics(results)
+        operator_distribution = self._operator_distribution(examples)
 
-        # Create summary
         summary = {
             "timestamp": datetime.now().isoformat(),
+            "split": split,
             "num_examples": len(results),
             "metrics": metrics,
+            "operator_distribution": operator_distribution,
             "results": results,
         }
 
-        # Save results
-        print(f"\nSaving results to {self.output_path}...")
-        with open(self.output_path, "w") as f:
-            json.dump(summary, f, indent=2)
+        with open(self.output_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
 
         logger.info(
             "evaluation_completed",
+            split=split,
             num_examples=len(results),
             output_path=str(self.output_path),
-            **metrics
+            **metrics,
         )
-
         return summary
 
-    def calculate_metrics(self, results: List[Dict[str, Any]]) -> Dict[str, float]:
-        """
-        Calculate aggregate metrics from results.
+    @staticmethod
+    def _operator_distribution(examples: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts = Counter()
+        for example in examples:
+            counts.update(FinQAEvaluator._program_ops(str(example.get("program") or "")))
+        return dict(counts)
 
-        Args:
-            results: List of evaluation results
-
-        Returns:
-            Dictionary of metrics
-        """
+    @staticmethod
+    def calculate_metrics(results: List[Dict[str, Any]]) -> Dict[str, float]:
         total = len(results)
         if total == 0:
             return {}
 
-        # Accuracy metrics
-        exact_matches = sum(1 for r in results if r["exact_match"])
-        numeric_matches = sum(1 for r in results if r["numeric_match"])
-        tolerance_matches = sum(1 for r in results if r["tolerance_match"])
+        def rate(key: str, expected: Any = True) -> float:
+            return round(sum(1 for row in results if row.get(key) == expected) / total, 4)
 
-        # Verification metrics
-        pass_count = sum(1 for r in results if r["verification_status"] == "PASS")
-        fail_count = sum(1 for r in results if r["verification_status"] == "FAIL")
-        uncertain_count = sum(1 for r in results if r["verification_status"] == "UNCERTAIN")
-        error_count = sum(1 for r in results if r["verification_status"] == "ERROR")
+        valid_latencies = [row["latency_ms"] for row in results]
+        operator_jaccards = [row["operator_jaccard"] for row in results]
 
-        # Retry metrics
-        retry_triggered = sum(1 for r in results if r["retry_count"] > 0)
-        total_retries = sum(r["retry_count"] for r in results)
-        retry_exhausted = sum(1 for r in results if r["retry_exhausted"])
+        calculator_tp = sum(
+            1
+            for row in results
+            if row["calculator_used"] and row["gold_requires_calculation"]
+        )
+        calculator_fp = sum(
+            1
+            for row in results
+            if row["calculator_used"] and not row["gold_requires_calculation"]
+        )
+        calculator_fn = sum(
+            1
+            for row in results
+            if not row["calculator_used"] and row["gold_requires_calculation"]
+        )
 
-        # Calculator usage
-        calculator_used = sum(1 for r in results if r["calculator_used"])
+        precision = calculator_tp / max(calculator_tp + calculator_fp, 1)
+        recall = calculator_tp / max(calculator_tp + calculator_fn, 1)
 
-        # Latency
-        valid_latencies = [r["latency_ms"] for r in results if r["latency_ms"] > 0]
-        avg_latency = sum(valid_latencies) / len(valid_latencies) if valid_latencies else 0
+        verification_pass_rate = rate("verification_status", "PASS")
+        verification_fail_rate = rate("verification_status", "FAIL")
+        verification_uncertain_rate = rate("verification_status", "UNCERTAIN")
 
-        # Error rate
-        errors = sum(1 for r in results if r["error"] is not None)
-
-        metrics = {
-            # Accuracy
-            "exact_match_rate": round(exact_matches / total, 4),
-            "numeric_match_rate": round(numeric_matches / total, 4),
-            "tolerance_match_rate": round(tolerance_matches / total, 4),
-
-            # Verification
-            "verification_pass_rate": round(pass_count / total, 4),
-            "verification_fail_rate": round(fail_count / total, 4),
-            "verification_uncertain_rate": round(uncertain_count / total, 4),
-            "verification_error_rate": round(error_count / total, 4),
-
-            # Retry
-            "retry_trigger_rate": round(retry_triggered / total, 4),
-            "avg_retries_per_question": round(total_retries / total, 3),
-            "retry_exhaustion_rate": round(retry_exhausted / total, 4),
-
-            # Calculator
-            "calculator_usage_rate": round(calculator_used / total, 4),
-
-            # Performance
-            "avg_latency_ms": round(avg_latency, 2),
-
-            # Errors
-            "error_rate": round(errors / total, 4),
+        return {
+            "exact_match_rate": rate("exact_match"),
+            "numeric_match_rate": rate("numeric_match"),
+            "tolerance_match_rate": rate("tolerance_match"),
+            "retrieval_answer_support_at_5": rate("retrieval_answer_support_at_5"),
+            "verification_pass_rate": verification_pass_rate,
+            "verification_fail_rate": verification_fail_rate,
+            "verification_uncertain_rate": verification_uncertain_rate,
+            "calculator_usage_rate": rate("calculator_used"),
+            "calculator_precision": round(precision, 4),
+            "calculator_recall": round(recall, 4),
+            "operator_match_rate": rate("operator_match"),
+            "avg_operator_jaccard": round(sum(operator_jaccards) / total, 4),
+            "avg_latency_ms": round(sum(valid_latencies) / total, 2),
+            "avg_retry_count": round(sum(row["retry_count"] for row in results) / total, 3),
         }
 
-        return metrics
-
-    def print_summary(self, summary: Dict[str, Any]) -> None:
-        """
-        Print evaluation summary.
-
-        Args:
-            summary: Evaluation summary dictionary
-        """
+    @staticmethod
+    def print_summary(summary: Dict[str, Any]) -> None:
         metrics = summary["metrics"]
-
         print("\n" + "=" * 80)
-        print("FINQA AGENT EVALUATION SUMMARY")
+        print("FINQA EVALUATION SUMMARY")
         print("=" * 80)
-        print(f"\nTimestamp: {summary['timestamp']}")
-        print(f"Examples evaluated: {summary['num_examples']}")
-        print(f"Results saved to: {self.output_path}")
-
-        print("\n" + "-" * 80)
-        print("ACCURACY METRICS")
-        print("-" * 80)
-        print(f"  Exact match rate:      {metrics['exact_match_rate']:>7.1%}")
-        print(f"  Numeric match rate:    {metrics['numeric_match_rate']:>7.1%}")
-        print(f"  Tolerance match rate:  {metrics['tolerance_match_rate']:>7.1%} (within 1%)")
-
-        print("\n" + "-" * 80)
-        print("VERIFICATION METRICS")
-        print("-" * 80)
-        print(f"  Pass rate:             {metrics['verification_pass_rate']:>7.1%}")
-        print(f"  Fail rate:             {metrics['verification_fail_rate']:>7.1%}")
-        print(f"  Uncertain rate:        {metrics['verification_uncertain_rate']:>7.1%}")
-        print(f"  Error rate:            {metrics['verification_error_rate']:>7.1%}")
-
-        print("\n" + "-" * 80)
-        print("RETRY METRICS")
-        print("-" * 80)
-        print(f"  Retry trigger rate:    {metrics['retry_trigger_rate']:>7.1%}")
-        print(f"  Avg retries/question:  {metrics['avg_retries_per_question']:>7.2f}")
-        print(f"  Retry exhaustion rate: {metrics['retry_exhaustion_rate']:>7.1%}")
-
-        print("\n" + "-" * 80)
-        print("PERFORMANCE METRICS")
-        print("-" * 80)
-        print(f"  Calculator usage rate: {metrics['calculator_usage_rate']:>7.1%}")
-        print(f"  Avg latency:           {metrics['avg_latency_ms']:>7.0f} ms")
-        print(f"  Error rate:            {metrics['error_rate']:>7.1%}")
-
-        print("\n" + "=" * 80)
+        print(f"Split: {summary['split']}")
+        print(f"Examples: {summary['num_examples']}")
+        print(f"Timestamp: {summary['timestamp']}")
+        print("\nAnswer Metrics")
+        print(f"  Exact match rate:        {metrics['exact_match_rate']:.1%}")
+        print(f"  Numeric match rate:      {metrics['numeric_match_rate']:.1%}")
+        print(f"  Tolerance match rate:    {metrics['tolerance_match_rate']:.1%}")
+        print("\nRetrieval Metrics")
+        print(f"  Answer support@5:        {metrics['retrieval_answer_support_at_5']:.1%}")
+        print("\nReasoning Metrics")
+        print(f"  Calculator precision:    {metrics['calculator_precision']:.1%}")
+        print(f"  Calculator recall:       {metrics['calculator_recall']:.1%}")
+        print(f"  Operator match rate:     {metrics['operator_match_rate']:.1%}")
+        print(f"  Avg operator jaccard:    {metrics['avg_operator_jaccard']:.3f}")
+        print("\nWorkflow Metrics")
+        print(f"  Verification pass rate:  {metrics['verification_pass_rate']:.1%}")
+        print(f"  Verification fail rate:  {metrics['verification_fail_rate']:.1%}")
+        print(f"  Verification uncertain:  {metrics['verification_uncertain_rate']:.1%}")
+        print(f"  Avg retry count:         {metrics['avg_retry_count']:.2f}")
+        print(f"  Avg latency:             {metrics['avg_latency_ms']:.0f} ms")
+        print("=" * 80)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Evaluate FinQA Agent on validation set")
-    parser.add_argument(
-        "--num-examples",
-        type=int,
-        default=20,
-        help="Number of validation examples to evaluate (default: 20)"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="data/eval_results.json",
-        help="Path to save results (default: data/eval_results.json)"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate the FinQA chatbot")
+    parser.add_argument("--split", default="validation", choices=["train", "validation", "test"])
+    parser.add_argument("--num-examples", type=int, default=20)
+    parser.add_argument("--output", type=str, default="data/eval_results.json")
     args = parser.parse_args()
 
-    # Run evaluation
     evaluator = FinQAEvaluator(output_path=args.output)
-    summary = evaluator.evaluate(num_examples=args.num_examples)
+    summary = evaluator.evaluate(split=args.split, num_examples=args.num_examples)
     evaluator.print_summary(summary)

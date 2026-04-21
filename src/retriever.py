@@ -1,548 +1,262 @@
-"""Hybrid retriever (FAISS + BM25) for FinQA dataset."""
+"""Document-local hybrid retrieval for FinQA evidence chunks."""
 
-import pickle
-from pathlib import Path
-from typing import Any, Dict, List
+from __future__ import annotations
 
-import faiss
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Sequence
+
 import numpy as np
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:  # pragma: no cover - optional dependency
+    BM25Okapi = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - optional dependency
+    SentenceTransformer = None
 
 from src.config import config
-from src.data_loader import load_finqa_dataset, prepare_example_for_rag
 from src.logger import LoggerContext, get_logger
 
 logger = get_logger(__name__)
 
 
+@dataclass
+class EvidenceChunk:
+    """A single retrievable span from a financial document."""
+
+    chunk_id: str
+    chunk_type: str
+    text: str
+    metadata: Dict[str, Any]
+
+
 class FinQARetriever:
-    """Hybrid retriever combining FAISS (dense) and BM25 (sparse) for FinQA dataset."""
+    """Hybrid retriever over chunks from the current FinQA document."""
 
-    def __init__(self, index_path: str = "./data/faiss_index"):
-        """
-        Initialize the FinQA hybrid retriever.
-
-        Args:
-            index_path: Path to save/load FAISS index and metadata
-        """
-        self.index_path = Path(index_path)
-        self.index_path.mkdir(parents=True, exist_ok=True)
-
+    def __init__(self) -> None:
         self.embedding_model_name = config.vector_store.embedding_model
-        self.embedding_model = None
-        self.faiss_index = None
-        self.bm25_index = None
-        self.documents = []
-        self.tokenized_contexts = []
-        self.dimension = None
+        self.embedding_model: SentenceTransformer | None = None
 
         logger.info(
             "retriever_initialized",
-            index_path=str(self.index_path),
+            retrieval_scope="document_local",
             embedding_model=self.embedding_model_name,
-            retrieval_type="hybrid_faiss_bm25",
+            dense_available=SentenceTransformer is not None,
+            sparse_available=BM25Okapi is not None,
         )
 
     def _load_embedding_model(self) -> None:
-        """Load the sentence transformer embedding model."""
+        if SentenceTransformer is None:
+            return
         if self.embedding_model is None:
             with LoggerContext(
-                logger, "load_embedding_model", model=self.embedding_model_name
+                logger,
+                "load_embedding_model",
+                model=self.embedding_model_name,
             ):
                 self.embedding_model = SentenceTransformer(self.embedding_model_name)
-                self.dimension = self.embedding_model.get_sentence_embedding_dimension()
-                logger.info(
-                    "embedding_model_loaded",
-                    model=self.embedding_model_name,
-                    dimension=self.dimension,
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r"[A-Za-z0-9\.\-%]+", text.lower())
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    def build_chunks(self, example: Dict[str, Any]) -> List[EvidenceChunk]:
+        """Split a FinQA example into evidence chunks for retrieval."""
+        chunks: List[EvidenceChunk] = []
+
+        for idx, paragraph in enumerate(example.get("pre_text", []) or []):
+            text = self._normalize_whitespace(str(paragraph))
+            if text:
+                chunks.append(
+                    EvidenceChunk(
+                        chunk_id=f"pre_{idx}",
+                        chunk_type="pre_text",
+                        text=text,
+                        metadata={"position": idx},
+                    )
                 )
 
-    def _tokenize_for_bm25(self, text: str) -> List[str]:
-        """
-        Tokenize text for BM25 (simple whitespace + lowercase).
-
-        Args:
-            text: Text to tokenize
-
-        Returns:
-            List of tokens
-        """
-        # Simple tokenization: lowercase, split on whitespace, filter short tokens
-        return [token.lower() for token in text.split() if len(token) > 1]
-
-    def _has_company_name(self, query: str) -> bool:
-        """
-        Detect if query contains a company name or stock-related proper noun.
-
-        Only triggers boost for actual company/stock queries, not geographic locations.
-
-        Args:
-            query: Query string
-
-        Returns:
-            True if query contains company indicators
-        """
-        # Stock/company indicator words
-        company_indicators = {
-            "stock", "stocks", "share", "shares", "corp", "corporation",
-            "inc", "incorporated", "ltd", "limited", "common", "preferred",
-            "equity", "equities", "ticker", "nasdaq", "nyse", "s&p"
-        }
-
-        # Geographic and temporal proper nouns to exclude
-        excluded_proper_nouns = {
-            # Countries
-            "canada", "china", "japan", "india", "france", "germany", "italy",
-            "spain", "brazil", "mexico", "russia", "korea", "australia",
-            "netherlands", "sweden", "norway", "denmark", "finland", "ireland",
-            "united", "states", "kingdom", "america", "american",
-            # Cities
-            "new", "york", "london", "paris", "tokyo", "toronto", "chicago",
-            "boston", "houston", "dallas", "seattle", "francisco", "los", "angeles",
-            # Months
-            "january", "february", "march", "april", "may", "june", "july",
-            "august", "september", "october", "november", "december",
-            # Common question words
-            "what", "when", "where", "who", "why", "how", "the", "is", "was",
-            "were", "are", "will", "would", "could", "should"
-        }
-
-        query_lower = query.lower()
-
-        # First check: does query contain stock/company indicator words?
-        has_indicator = any(indicator in query_lower for indicator in company_indicators)
-
-        if not has_indicator:
-            # No company indicators, don't boost
-            return False
-
-        # Second check: find capitalized words that aren't excluded
-        words = query.split()
-        for word in words:
-            # Strip punctuation from word
-            clean_word = word.strip(",.?!;:")
-
-            if clean_word and clean_word[0].isupper():
-                word_lower = clean_word.lower()
-                # If it's capitalized AND not in exclusion list, it's likely a company
-                if word_lower not in excluded_proper_nouns:
-                    return True
-
-        return False
-
-    def build_index(self) -> None:
-        """Build both FAISS and BM25 indices from train set."""
-        with LoggerContext(logger, "build_index"):
-            # Load embedding model
-            self._load_embedding_model()
-
-            # Load dataset
-            dataset = load_finqa_dataset(split="train")
-            logger.info("dataset_loaded_for_indexing", num_examples=len(dataset))
-
-            # Prepare all examples
-            self.documents = []
-            contexts = []
-            self.tokenized_contexts = []
-
-            logger.info("preparing_examples_for_embedding", total=len(dataset))
-
-            for idx, example in enumerate(dataset):
-                prepared = prepare_example_for_rag(example)
-
-                # Store document with metadata
-                doc = {
-                    "question": prepared["question"],
-                    "answer": prepared["answer"],
-                    "program": prepared["program"],
-                    "context": prepared["context"],
-                    "table_str": prepared["table_str"],
-                    "raw_table": prepared["raw_table"],
-                    "doc_id": idx,
-                }
-                self.documents.append(doc)
-                contexts.append(prepared["context"])
-
-                # Tokenize for BM25
-                self.tokenized_contexts.append(self._tokenize_for_bm25(prepared["context"]))
-
-                # Log progress every 1000 documents
-                if (idx + 1) % 1000 == 0:
-                    logger.info("embedding_progress", processed=idx + 1, total=len(dataset))
-
-            logger.info("examples_prepared", total=len(self.documents))
-
-            # Build FAISS index
-            with LoggerContext(logger, "embed_contexts", num_contexts=len(contexts)):
-                embeddings = self.embedding_model.encode(
-                    contexts,
-                    show_progress_bar=True,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                )
-                logger.info(
-                    "embeddings_created",
-                    shape=embeddings.shape,
-                    dtype=str(embeddings.dtype),
+        table = example.get("table", []) or []
+        if table:
+            headers = [self._normalize_whitespace(str(cell)) for cell in table[0]]
+            if headers:
+                header_text = " | ".join(headers)
+                chunks.append(
+                    EvidenceChunk(
+                        chunk_id="table_header",
+                        chunk_type="table_header",
+                        text=f"Table columns: {header_text}",
+                        metadata={"position": 0},
+                    )
                 )
 
-            with LoggerContext(logger, "build_faiss_index", dimension=self.dimension):
-                # Use IndexFlatIP for cosine similarity (since embeddings are normalized)
-                self.faiss_index = faiss.IndexFlatIP(self.dimension)
-                self.faiss_index.add(embeddings)
-                logger.info(
-                    "faiss_index_built",
-                    total_vectors=self.faiss_index.ntotal,
-                    dimension=self.dimension,
+            for row_idx, row in enumerate(table[1:], start=1):
+                cells = [self._normalize_whitespace(str(cell)) for cell in row]
+                pair_text = "; ".join(
+                    f"{header}: {value}"
+                    for header, value in zip(headers, cells)
+                    if value
+                )
+                if pair_text:
+                    chunks.append(
+                        EvidenceChunk(
+                            chunk_id=f"table_row_{row_idx}",
+                            chunk_type="table_row",
+                            text=pair_text,
+                            metadata={"position": row_idx},
+                        )
+                    )
+
+        for idx, paragraph in enumerate(example.get("post_text", []) or []):
+            text = self._normalize_whitespace(str(paragraph))
+            if text:
+                chunks.append(
+                    EvidenceChunk(
+                        chunk_id=f"post_{idx}",
+                        chunk_type="post_text",
+                        text=text,
+                        metadata={"position": idx},
+                    )
                 )
 
-            # Build BM25 index
-            with LoggerContext(logger, "build_bm25_index", num_documents=len(self.tokenized_contexts)):
-                self.bm25_index = BM25Okapi(self.tokenized_contexts)
-                logger.info(
-                    "bm25_index_built",
-                    num_documents=len(self.tokenized_contexts),
-                )
+        logger.info(
+            "document_chunked",
+            example_id=example.get("id"),
+            num_chunks=len(chunks),
+        )
+        return chunks
 
-            # Save the indices
-            self.save_index()
-
-    def save_index(self) -> None:
-        """Save FAISS index, BM25 index, and metadata to disk."""
-        if self.faiss_index is None or self.bm25_index is None:
-            logger.warning("save_index_skipped", reason="indices_not_built")
-            return
-
-        with LoggerContext(logger, "save_index", path=str(self.index_path)):
-            # Save FAISS index
-            faiss_file = self.index_path / "faiss.index"
-            faiss.write_index(self.faiss_index, str(faiss_file))
-            logger.info("faiss_index_saved", file=str(faiss_file))
-
-            # Save BM25 index (pickle the BM25Okapi object)
-            bm25_file = self.index_path / "bm25.index"
-            with open(bm25_file, "wb") as f:
-                pickle.dump(self.bm25_index, f)
-            logger.info("bm25_index_saved", file=str(bm25_file))
-
-            # Save metadata (documents + tokenized contexts)
-            metadata_file = self.index_path / "metadata.pkl"
-            with open(metadata_file, "wb") as f:
-                pickle.dump(
-                    {
-                        "documents": self.documents,
-                        "tokenized_contexts": self.tokenized_contexts,
-                        "dimension": self.dimension,
-                        "embedding_model": self.embedding_model_name,
-                    },
-                    f,
-                )
-            logger.info(
-                "metadata_saved",
-                file=str(metadata_file),
-                num_documents=len(self.documents),
-            )
-
-    def load_index(self) -> bool:
-        """
-        Load FAISS index, BM25 index, and metadata from disk.
-
-        Returns:
-            True if indices loaded successfully, False otherwise
-        """
-        import shutil
-
-        faiss_file = self.index_path / "faiss.index"
-        bm25_file = self.index_path / "bm25.index"
-        metadata_file = self.index_path / "metadata.pkl"
-
-        if not faiss_file.exists() or not bm25_file.exists() or not metadata_file.exists():
-            logger.warning(
-                "load_index_failed",
-                reason="files_not_found",
-                faiss_exists=faiss_file.exists(),
-                bm25_exists=bm25_file.exists(),
-                metadata_exists=metadata_file.exists(),
-            )
-            return False
-
-        with LoggerContext(logger, "load_index", path=str(self.index_path)):
-            # Load FAISS index
-            self.faiss_index = faiss.read_index(str(faiss_file))
-            logger.info(
-                "faiss_index_loaded",
-                file=str(faiss_file),
-                total_vectors=self.faiss_index.ntotal,
-            )
-
-            # Load BM25 index
-            with open(bm25_file, "rb") as f:
-                self.bm25_index = pickle.load(f)
-            logger.info("bm25_index_loaded", file=str(bm25_file))
-
-            # Load metadata
-            with open(metadata_file, "rb") as f:
-                metadata = pickle.load(f)
-
-            self.documents = metadata["documents"]
-            self.tokenized_contexts = metadata["tokenized_contexts"]
-            self.dimension = metadata["dimension"]
-            embedding_model_name = metadata["embedding_model"]
-
-            logger.info(
-                "metadata_loaded",
-                file=str(metadata_file),
-                num_documents=len(self.documents),
-                dimension=self.dimension,
-                embedding_model=embedding_model_name,
-            )
-
-            # Load embedding model if not already loaded
-            if self.embedding_model is None:
-                self._load_embedding_model()
-
-            # Verify embedding model matches - if not, delete index and rebuild
-            if embedding_model_name != self.embedding_model_name:
-                logger.warning(
-                    "embedding_model_mismatch_deleting_index",
-                    index_model=embedding_model_name,
-                    config_model=self.embedding_model_name,
-                    action="deleting_old_index",
-                )
-                # Delete old index
-                shutil.rmtree(self.index_path)
-                self.index_path.mkdir(parents=True, exist_ok=True)
-                logger.info(
-                    "old_index_deleted",
-                    reason="model_mismatch",
-                    old_model=embedding_model_name,
-                    new_model=self.embedding_model_name,
-                )
-                return False
-
-            return True
-
-    def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Retrieve top-k relevant documents using FAISS only.
-
-        Args:
-            query: Query string
-            k: Number of documents to retrieve
-
-        Returns:
-            List of documents with metadata and similarity scores
-        """
-        if self.faiss_index is None:
-            logger.error("retrieve_failed", reason="no_index_loaded")
-            raise RuntimeError("Index not loaded. Call load_index() or build_index() first.")
-
-        with LoggerContext(logger, "retrieve_faiss", query=query, k=k):
-            # Load embedding model if needed
-            if self.embedding_model is None:
-                self._load_embedding_model()
-
-            # Embed query
-            query_embedding = self.embedding_model.encode(
-                [query],
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-
-            # Search FAISS index
-            scores, indices = self.faiss_index.search(query_embedding, k)
-
-            # Prepare results
-            results = []
-            for score, idx in zip(scores[0], indices[0]):
-                if idx < len(self.documents):
-                    result = self.documents[idx].copy()
-                    result["faiss_score"] = float(score)
-                    result["similarity_score"] = float(score)  # For backward compatibility
-                    results.append(result)
-
-            logger.info(
-                "retrieval_completed",
-                query=query,
-                k=k,
-                num_results=len(results),
-                top_score=results[0]["similarity_score"] if results else None,
-            )
-
-            return results
-
-    def retrieve_hybrid(
+    def retrieve_for_example(
         self,
-        query: str,
-        k: int = 8,
-        faiss_weight: float = 0.7,
-        bm25_weight: float = 0.3,
+        question: str,
+        example: Dict[str, Any],
+        k: int | None = None,
+        dense_weight: float | None = None,
+        sparse_weight: float | None = None,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve top-k relevant documents using hybrid FAISS + BM25 retrieval.
+        Retrieve top-k evidence chunks from the current document.
 
-        Combines dense (FAISS) and sparse (BM25) retrieval using weighted score fusion.
-        Automatically boosts BM25 weight when company names are detected in query.
-
-        Args:
-            query: Query string
-            k: Number of documents to retrieve (default 8)
-            faiss_weight: Weight for FAISS scores (default 0.7, adjusted to 0.5 if company name detected)
-            bm25_weight: Weight for BM25 scores (default 0.3, adjusted to 0.5 if company name detected)
-
-        Returns:
-            List of documents with metadata and hybrid scores
+        This is the retrieval path used for answer generation and evaluation.
         """
-        if self.faiss_index is None or self.bm25_index is None:
-            logger.error("retrieve_hybrid_failed", reason="indices_not_loaded")
-            raise RuntimeError("Indices not loaded. Call load_index() or build_index() first.")
+        chunks = self.build_chunks(example)
+        if not chunks:
+            return []
 
-        # Detect company names and adjust weights
-        has_company = self._has_company_name(query)
-        if has_company:
-            faiss_weight = 0.5
-            bm25_weight = 0.5
-            logger.info(
-                "company_name_detected",
-                query=query,
-                adjusted_faiss_weight=faiss_weight,
-                adjusted_bm25_weight=bm25_weight,
-            )
+        k = k or config.agent.retrieval_top_k
+        dense_weight = config.agent.dense_weight if dense_weight is None else dense_weight
+        sparse_weight = config.agent.sparse_weight if sparse_weight is None else sparse_weight
 
         with LoggerContext(
             logger,
-            "retrieve_hybrid",
-            query=query,
+            "retrieve_for_example",
+            question=question,
             k=k,
-            faiss_weight=faiss_weight,
-            bm25_weight=bm25_weight,
+            dense_weight=dense_weight,
+            sparse_weight=sparse_weight,
         ):
-            # Load embedding model if needed
-            if self.embedding_model is None:
-                self._load_embedding_model()
+            chunk_texts = [chunk.text for chunk in chunks]
+            self._load_embedding_model()
 
-            # FAISS retrieval (get more candidates for reranking)
-            k_candidates = min(k * 3, len(self.documents))  # Get 3x candidates
+            if self.embedding_model is not None:
+                dense_inputs = [question] + chunk_texts
+                embeddings = self.embedding_model.encode(
+                    dense_inputs,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                query_embedding = embeddings[0]
+                chunk_embeddings = embeddings[1:]
+                dense_scores = np.dot(chunk_embeddings, query_embedding)
+                dense_scores_norm = (dense_scores + 1.0) / 2.0
+            else:
+                dense_scores_norm = np.zeros(len(chunk_texts))
 
-            query_embedding = self.embedding_model.encode(
-                [query],
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-
-            faiss_scores, faiss_indices = self.faiss_index.search(query_embedding, k_candidates)
-            faiss_scores = faiss_scores[0]
-            faiss_indices = faiss_indices[0]
-
-            # BM25 retrieval
-            tokenized_query = self._tokenize_for_bm25(query)
-            bm25_scores = self.bm25_index.get_scores(tokenized_query)
-
-            # Normalize scores to [0, 1] range
-            # FAISS scores (cosine similarity) are already in [-1, 1], shift to [0, 1]
-            faiss_scores_norm = (faiss_scores + 1) / 2
-
-            # BM25 scores: normalize by max score
-            bm25_max = bm25_scores.max() if bm25_scores.max() > 0 else 1.0
-            bm25_scores_norm = bm25_scores / bm25_max
-
-            # Create score dictionary for all documents
-            hybrid_scores = {}
-
-            # Add FAISS scores for candidates
-            for idx, score_norm in zip(faiss_indices, faiss_scores_norm):
-                if idx < len(self.documents):
-                    hybrid_scores[int(idx)] = {
-                        "faiss_score": float(score_norm),
-                        "bm25_score": float(bm25_scores_norm[idx]),
-                        "faiss_raw": float(faiss_scores[list(faiss_indices).index(idx)]),
-                        "bm25_raw": float(bm25_scores[idx]),
-                    }
-
-            # Calculate hybrid scores
-            for idx in hybrid_scores:
-                faiss_s = hybrid_scores[idx]["faiss_score"]
-                bm25_s = hybrid_scores[idx]["bm25_score"]
-                hybrid_scores[idx]["hybrid_score"] = (
-                    faiss_weight * faiss_s + bm25_weight * bm25_s
+            if BM25Okapi is not None:
+                tokenized_chunks = [self._tokenize(text) for text in chunk_texts]
+                bm25 = BM25Okapi(tokenized_chunks)
+                sparse_scores = bm25.get_scores(self._tokenize(question))
+                sparse_max = float(np.max(sparse_scores)) if len(sparse_scores) else 0.0
+                sparse_scores_norm = sparse_scores / sparse_max if sparse_max > 0 else sparse_scores
+            else:
+                sparse_scores_norm = np.array(
+                    [
+                        self._token_overlap_score(self._tokenize(question), self._tokenize(text))
+                        for text in chunk_texts
+                    ]
                 )
 
-            # Sort by hybrid score and get top-k
-            sorted_indices = sorted(
-                hybrid_scores.keys(),
-                key=lambda idx: hybrid_scores[idx]["hybrid_score"],
-                reverse=True,
-            )[:k]
+            results: List[Dict[str, Any]] = []
+            for idx, chunk in enumerate(chunks):
+                hybrid_score = (dense_weight * float(dense_scores_norm[idx])) + (
+                    sparse_weight * float(sparse_scores_norm[idx])
+                )
+                results.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "chunk_type": chunk.chunk_type,
+                        "text": chunk.text,
+                        "metadata": chunk.metadata,
+                        "dense_score": float(dense_scores_norm[idx]),
+                        "sparse_score": float(sparse_scores_norm[idx]),
+                        "hybrid_score": hybrid_score,
+                    }
+                )
 
-            # Prepare results
-            results = []
-            for idx in sorted_indices:
-                result = self.documents[idx].copy()
-                result["doc_id"] = idx
-                result["hybrid_score"] = hybrid_scores[idx]["hybrid_score"]
-                result["faiss_score_normalized"] = hybrid_scores[idx]["faiss_score"]
-                result["bm25_score_normalized"] = hybrid_scores[idx]["bm25_score"]
-                result["faiss_score_raw"] = hybrid_scores[idx]["faiss_raw"]
-                result["bm25_score_raw"] = hybrid_scores[idx]["bm25_raw"]
-                results.append(result)
-
+            ranked = sorted(results, key=lambda item: item["hybrid_score"], reverse=True)[:k]
             logger.info(
-                "hybrid_retrieval_completed",
-                query=query,
-                k=k,
-                num_results=len(results),
-                top_hybrid_score=results[0]["hybrid_score"] if results else None,
-                faiss_weight=faiss_weight,
-                bm25_weight=bm25_weight,
-                company_boost_active=has_company,
+                "document_retrieval_completed",
+                question=question,
+                num_chunks=len(chunks),
+                num_results=len(ranked),
+                top_chunk_id=ranked[0]["chunk_id"] if ranked else None,
+                top_hybrid_score=ranked[0]["hybrid_score"] if ranked else None,
             )
+            return ranked
 
-            return results
+    @staticmethod
+    def _token_overlap_score(query_tokens: Sequence[str], chunk_tokens: Sequence[str]) -> float:
+        if not query_tokens or not chunk_tokens:
+            return 0.0
+        query_set = set(query_tokens)
+        chunk_set = set(chunk_tokens)
+        return len(query_set & chunk_set) / max(len(query_set), 1)
+
+    def answer_in_top_k(self, example: Dict[str, Any], question: str, k: int = 5) -> bool:
+        """Heuristic retrieval metric: whether a normalized gold answer appears in top-k chunks."""
+        gold = self._normalize_whitespace(str(example.get("exe_ans") or example.get("answer") or ""))
+        if not gold:
+            return False
+
+        normalized_gold = gold.lower().replace(",", "")
+        retrieved = self.retrieve_for_example(question=question, example=example, k=k)
+        for chunk in retrieved:
+            chunk_text = chunk["text"].lower().replace(",", "")
+            if normalized_gold in chunk_text:
+                return True
+        return False
 
 
 if __name__ == "__main__":
-    """
-    Example usage: Build index and test hybrid retrieval.
-    Run with: python -m src.retriever
-    """
-    # Initialize retriever
+    from src.data_loader import load_finqa_dataset
+
+    dataset = load_finqa_dataset(split="validation")
+    example = dataset[0]
+
     retriever = FinQARetriever()
+    results = retriever.retrieve_for_example(example["question"], example, k=5)
 
-    # Try to load existing index
-    if not retriever.load_index():
-        print("\nNo existing index found. Building new hybrid index from train set...")
-        retriever.build_index()
-        print("\nHybrid index (FAISS + BM25) built and saved successfully!")
-    else:
-        print("\nHybrid index (FAISS + BM25) loaded successfully!")
-
-    # Test hybrid retrieval
-    print("\n" + "="*80)
-    print("TESTING HYBRID RETRIEVAL (FAISS + BM25)")
-    print("="*80 + "\n")
-
-    test_query = "what is the interest expense in 2009?"
-    print(f"Query: {test_query}\n")
-
-    results = retriever.retrieve_hybrid(test_query, k=5, faiss_weight=0.7, bm25_weight=0.3)
-
-    print(f"Retrieved {len(results)} documents:\n")
-
-    for i, result in enumerate(results, 1):
-        print(f"{'─'*80}")
-        print(f"RESULT #{i}")
-        print(f"{'─'*80}")
-        print(f"Hybrid Score: {result['hybrid_score']:.4f}")
-        print(f"  FAISS (normalized): {result['faiss_score_normalized']:.4f} (raw: {result['faiss_score_raw']:.4f})")
-        print(f"  BM25  (normalized): {result['bm25_score_normalized']:.4f} (raw: {result['bm25_score_raw']:.4f})")
-        print(f"\nQuestion: {result['question']}")
-        print(f"\nAnswer: {result['answer']}")
-        print(f"\nProgram: {result['program']}")
-        print(f"\nContext Preview (first 300 chars):")
-        print(f"{result['context'][:300]}...")
-        print()
-
-    print("="*80)
-    print("HYBRID RETRIEVAL TEST COMPLETE")
-    print("="*80)
+    print(f"Question: {example['question']}\n")
+    for idx, item in enumerate(results, start=1):
+        print(
+            f"{idx}. {item['chunk_id']} [{item['chunk_type']}] "
+            f"hybrid={item['hybrid_score']:.3f}"
+        )
+        print(f"   {item['text'][:200]}")

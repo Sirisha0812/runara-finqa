@@ -1,9 +1,8 @@
-"""Data loader for FinQA dataset from HuggingFace."""
+"""Data loader and dataset analysis helpers for FinQA."""
 
+import re
+from statistics import mean
 from typing import Any, Dict, List, Optional
-
-from datasets import load_dataset
-import pandas as pd
 
 from src.logger import get_logger, LoggerContext
 
@@ -75,7 +74,7 @@ def load_finqa_dataset(
     dataset_name: str = "ibm/finqa",
     split: str = "train",
     cache_dir: Optional[str] = None,
-) -> Any:
+) -> List[Dict[str, Any]]:
     """
     Load FinQA dataset from HuggingFace.
 
@@ -87,7 +86,7 @@ def load_finqa_dataset(
         cache_dir: Optional directory to cache dataset
 
     Returns:
-        HuggingFace Dataset object
+        List of flattened FinQA examples
     """
     with LoggerContext(
         logger,
@@ -147,19 +146,15 @@ def load_finqa_dataset(
                 flat_item["exe_ans"] = str(item["qa"].get("exe_ans", ""))  # Convert to string
             flattened_data.append(flat_item)
 
-        # Convert to Dataset
-        from datasets import Dataset
-        dataset = Dataset.from_list(flattened_data)
-
         logger.info(
             "dataset_loaded",
             dataset_name=dataset_name,
             split=split,
-            num_examples=len(dataset),
-            features=list(dataset.features.keys()),
+            num_examples=len(flattened_data),
+            features=list(flattened_data[0].keys()) if flattened_data else [],
         )
 
-        return dataset
+        return flattened_data
 
 
 def display_examples(
@@ -269,11 +264,11 @@ def get_dataset_info(dataset: Any) -> Dict[str, Any]:
 
     info = {
         "num_examples": len(dataset),
-        "features": list(dataset.features.keys()),
+        "features": list(dataset[0].keys()) if len(dataset) > 0 else [],
         "feature_types": {
-            key: str(dataset.features[key])
-            for key in dataset.features.keys()
-        },
+            key: type(dataset[0][key]).__name__
+            for key in dataset[0].keys()
+        } if len(dataset) > 0 else {},
     }
 
     # Sample first example to see actual data structure
@@ -292,6 +287,41 @@ def get_dataset_info(dataset: Any) -> Dict[str, Any]:
     )
 
     return info
+
+
+def analyze_dataset(dataset: Any) -> Dict[str, Any]:
+    """Compute dataset statistics used in the technical report."""
+    context_lengths: List[int] = []
+    table_row_counts: List[int] = []
+    question_lengths: List[int] = []
+    operator_counts: Dict[str, int] = {}
+    arithmetic_examples = 0
+
+    operator_pattern = re.compile(
+        r"(add|subtract|multiply|divide|exp|greater|table_max|table_min|table_sum|table_average)"
+    )
+
+    for example in dataset:
+        prepared = prepare_example_for_rag(example)
+        context_lengths.append(len(prepared["context"]))
+        question_lengths.append(len(prepared["question"].split()))
+        raw_table = prepared["raw_table"] or []
+        table_row_counts.append(max(len(raw_table) - 1, 0))
+
+        operators = operator_pattern.findall(str(prepared["program"]))
+        if operators:
+            arithmetic_examples += 1
+        for operator in operators:
+            operator_counts[operator] = operator_counts.get(operator, 0) + 1
+
+    return {
+        "num_examples": len(dataset),
+        "avg_context_chars": round(mean(context_lengths), 1) if context_lengths else 0.0,
+        "avg_question_tokens": round(mean(question_lengths), 1) if question_lengths else 0.0,
+        "avg_table_rows": round(mean(table_row_counts), 1) if table_row_counts else 0.0,
+        "arithmetic_example_rate": round(arithmetic_examples / len(dataset), 4) if len(dataset) else 0.0,
+        "operator_counts": dict(sorted(operator_counts.items(), key=lambda item: item[1], reverse=True)),
+    }
 
 
 def print_dataset_info(dataset: Any) -> None:

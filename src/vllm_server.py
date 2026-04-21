@@ -1,7 +1,7 @@
-"""vLLM server for FinQA chatbot with GPU/MPS support.
+"""vLLM server launcher for the FinQA chatbot.
 
-NOTE: vLLM requires CUDA (NVIDIA GPUs) and does NOT work on Mac.
-For Mac users, use src/ollama_server.py instead.
+This project targets a Hugging Face instruct model served via vLLM's
+OpenAI-compatible API.
 """
 
 import argparse
@@ -95,6 +95,42 @@ def start_vllm_server(
         else:
             logger.info("device_forced", device=device)
 
+        # vLLM CPU support depends on a dedicated CPU build. The common pip
+        # installs used for CUDA inference do not accept `--device cpu`, and
+        # Apple Silicon support is still experimental in the official docs.
+        if device in {"cpu", "mps"}:
+            logger.error(
+                "unsupported_local_vllm_mode",
+                device=device,
+                recommendation=(
+                    "Use a CUDA GPU for vLLM, or install a CPU-specific vLLM build "
+                    "following the official CPU docs."
+                ),
+            )
+            print("\n" + "=" * 80)
+            print("vLLM Startup Blocked")
+            print("=" * 80)
+            print(f"\nDetected device: {device.upper()}")
+            print(
+                "\nThis launcher only supports the standard CUDA vLLM serving path."
+            )
+            print(
+                "Your current vLLM installation does not support the `--device cpu` "
+                "fallback used by older examples."
+            )
+            print("\nWhat to do instead:")
+            print("1. Run the model on a CUDA GPU and point VLLM_API_BASE at that server.")
+            print(
+                "2. Or install a CPU-specific vLLM build using the official CPU instructions:"
+            )
+            print("   https://docs.vllm.ai/en/latest/getting_started/installation/cpu.html")
+            print(
+                "3. On Apple Silicon, prefer a remote CUDA vLLM endpoint; local macOS vLLM "
+                "CPU support is experimental."
+            )
+            print("=" * 80 + "\n")
+            sys.exit(1)
+
         # Build vLLM command
         cmd = [
             "vllm",
@@ -105,6 +141,10 @@ def start_vllm_server(
             "--max-model-len",
             str(max_len),
             "--trust-remote-code",
+            "--dtype",
+            "auto",
+            "--generation-config",
+            "vllm",
         ]
 
         # Add device-specific arguments
@@ -122,23 +162,6 @@ def start_vllm_server(
                 tensor_parallel_size=tp_size,
                 gpu_memory_utilization=gpu_memory_utilization,
             )
-        elif device == "mps":
-            # vLLM doesn't natively support MPS, but we can try CPU mode
-            logger.warning(
-                "mps_limitation",
-                message="vLLM does not natively support Apple MPS. Falling back to CPU mode.",
-                recommendation="Consider using a CUDA-enabled GPU for better performance.",
-            )
-            cmd.extend(["--device", "cpu"])
-            device = "cpu"
-        elif device == "cpu":
-            cmd.extend(["--device", "cpu"])
-            logger.warning(
-                "cpu_mode_warning",
-                message="Running on CPU - inference will be very slow (30-60s per response).",
-                recommendation="Use a CUDA-enabled GPU for production workloads.",
-            )
-
         # Log configuration
         logger.info(
             "vllm_server_starting",
@@ -161,14 +184,6 @@ def start_vllm_server(
         if device == "cuda":
             print(f"Tensor Parallel Size: {tp_size}")
             print(f"GPU Memory Utilization: {gpu_memory_utilization * 100:.0f}%")
-        elif device == "cpu":
-            print(
-                "\n⚠️  WARNING: Running on CPU - inference will be very slow (30-60s per response)."
-            )
-            print(
-                "   For production use, please run on a CUDA-enabled GPU with at least 48GB VRAM."
-            )
-
         print("\nStarting server...\n")
         print("=" * 80)
 

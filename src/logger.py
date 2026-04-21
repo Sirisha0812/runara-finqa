@@ -1,13 +1,23 @@
-"""Structured logging setup with GPU monitoring for FinQA chatbot."""
+"""Structured logging setup with optional GPU monitoring."""
 
 import logging
 import sys
 import time
 from typing import Any, Optional
 
-import structlog
-from structlog.processors import JSONRenderer, TimeStamper
-from structlog.stdlib import add_log_level, filter_by_level
+try:
+    import structlog
+    from structlog.processors import JSONRenderer, TimeStamper
+    from structlog.stdlib import add_log_level, filter_by_level
+
+    STRUCTLOG_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment-specific fallback
+    structlog = None
+    JSONRenderer = None
+    TimeStamper = None
+    add_log_level = None
+    filter_by_level = None
+    STRUCTLOG_AVAILABLE = False
 
 from src.config import config
 
@@ -18,6 +28,28 @@ try:
     pynvml.nvmlInit()
 except Exception:
     GPU_AVAILABLE = False
+
+
+class StdlibLoggerAdapter:
+    """Small adapter so stdlib logging accepts structlog-style kwargs."""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+
+    def _log(self, level: str, event: str, **kwargs: Any) -> None:
+        message = event
+        if kwargs:
+            message = f"{event} | {kwargs}"
+        getattr(self.logger, level)(message)
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self._log("info", event, **kwargs)
+
+    def warning(self, event: str, **kwargs: Any) -> None:
+        self._log("warning", event, **kwargs)
+
+    def error(self, event: str, **kwargs: Any) -> None:
+        self._log("error", event, **kwargs)
 
 
 def get_gpu_utilization() -> Optional[dict[str, Any]]:
@@ -56,6 +88,13 @@ def add_app_context(logger: Any, method_name: str, event_dict: dict) -> dict:
 
 def setup_logging() -> None:
     """Configure structured logging with GPU monitoring."""
+    if not STRUCTLOG_AVAILABLE:
+        logging.basicConfig(
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            stream=sys.stdout,
+            level=getattr(logging, config.logging.level),
+        )
+        return
 
     # Determine if we want JSON or console output
     if config.logging.format == "json":
@@ -94,7 +133,7 @@ class LoggerContext:
 
     def __init__(
         self,
-        logger: structlog.BoundLogger,
+        logger: Any,
         operation: str,
         **kwargs: Any,
     ):
@@ -103,7 +142,7 @@ class LoggerContext:
         self.context = kwargs
         self.start_time: Optional[float] = None
 
-    def __enter__(self) -> structlog.BoundLogger:
+    def __enter__(self) -> Any:
         """Start timing and log entry."""
         self.start_time = time.time()
         self.logger.info(
@@ -135,9 +174,11 @@ class LoggerContext:
             )
 
 
-def get_logger(name: str) -> structlog.BoundLogger:
+def get_logger(name: str) -> Any:
     """Get a logger instance with the given name."""
-    return structlog.get_logger(name)
+    if STRUCTLOG_AVAILABLE:
+        return structlog.get_logger(name)
+    return StdlibLoggerAdapter(logging.getLogger(name))
 
 
 # Initialize logging on module import
